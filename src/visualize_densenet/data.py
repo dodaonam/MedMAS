@@ -30,6 +30,28 @@ def _load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _validate_class_weights(class_weights: dict[str, Any], labels: list[str]) -> None:
+    required_keys = [
+        "target_label_order",
+        "train_positive_counts",
+        "train_negative_counts",
+        "raw_train_only_pos_weight",
+        "selected_clipped_pos_weight",
+        "selection_rule",
+    ]
+    missing_keys = [key for key in required_keys if key not in class_weights]
+    if missing_keys:
+        raise ValueError(f"class_weights.json is missing required keys: {missing_keys}")
+    if class_weights["target_label_order"] != labels:
+        raise ValueError(
+            f"class_weights.json target label order mismatch. Expected {labels!r}, got {class_weights['target_label_order']!r}"
+        )
+    for section in ["train_positive_counts", "train_negative_counts", "raw_train_only_pos_weight", "selected_clipped_pos_weight"]:
+        missing_labels = [label for label in labels if label not in class_weights[section]]
+        if missing_labels:
+            raise ValueError(f"class_weights.json section {section!r} is missing labels: {missing_labels}")
+
+
 def _run_id_from_frame(frame: pd.DataFrame, path: Path) -> str | None:
     if "run_id" not in frame.columns or frame.empty:
         return None
@@ -78,6 +100,7 @@ def load_visualization_artifacts(run_dir: Path, target_labels_path: Path | None 
         labels = load_target_labels(target_labels_path)
     if labels != TARGET_LABELS:
         raise ValueError(f"Unexpected target label order: {labels!r}")
+    _validate_class_weights(class_weights, list(labels))
     _validate_run_ids(
         expected=run_id,
         history=history,

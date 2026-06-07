@@ -17,10 +17,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-labels-path", type=Path, default=ROOT / "artifacts" / "preprocess" / "target_labels.json")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "artifacts" / "training" / "densenet121_cnn_head")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--batch-size", type=int, default=16)
-    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--batch-size", type=int, default=128)
+    parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--stage1-epochs", type=int, default=5)
-    parser.add_argument("--stage2-epochs", type=int, default=20)
+    parser.add_argument("--stage2-epochs", type=int, default=25)
     parser.add_argument("--stage2-min-epochs-before-early-stop", type=int, default=5)
     parser.add_argument("--early-stopping-patience", type=int, default=5)
     parser.add_argument("--head-lr-stage1", type=float, default=3e-4)
@@ -40,7 +40,12 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        from train_densenet.artifacts import load_target_labels
+        from train_densenet.artifacts import (
+            build_class_weights_payload_from_manifest,
+            load_target_labels,
+            selected_pos_weights_from_payload,
+        )
+        from train_densenet.dataset import load_split_manifest
         from train_densenet.model import DenseNet121CNNHead, configure_stage1
         from train_densenet.train import (
             TrainingConfig,
@@ -82,8 +87,11 @@ def main(argv: list[str] | None = None) -> int:
         dataloaders = build_dataloaders(config, labels)
         model = DenseNet121CNNHead(num_classes=len(labels)).to(device)
         configure_stage1(model)
-        criterion = create_criterion(device)
-        run_stage0_smoke(model, dataloaders["train"], criterion, device)
+        manifest = load_split_manifest(config.manifest_path, labels)
+        class_weights_payload = build_class_weights_payload_from_manifest(manifest, labels)
+        selected_pos_weights = selected_pos_weights_from_payload(class_weights_payload, labels)
+        criterion = create_criterion(device, selected_pos_weights, labels)
+        run_stage0_smoke(model, dataloaders["train"], criterion, device, labels)
         print("Stage 0 smoke check passed. No training epochs were run.")
         return 0
 

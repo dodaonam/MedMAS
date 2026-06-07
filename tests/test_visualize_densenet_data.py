@@ -13,7 +13,16 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from train_densenet.artifacts import TARGET_LABELS, RunConfig, label_slug, resolve_artifact_paths, save_json, write_class_weights, write_run_config
+from train_densenet.artifacts import (
+    TARGET_LABELS,
+    RunConfig,
+    build_class_weights_payload,
+    label_slug,
+    resolve_artifact_paths,
+    save_json,
+    write_class_weights,
+    write_run_config,
+)
 from train_densenet.metrics import compute_multilabel_metrics
 from train_densenet.thresholds import select_validation_thresholds, thresholds_by_label
 from visualize_densenet.data import load_visualization_artifacts
@@ -70,7 +79,12 @@ class DenseNetVisualizationDataTests(unittest.TestCase):
             paths = resolve_artifact_paths(run_dir)
             paths.output_dir.mkdir(parents=True)
             write_run_config(paths.config_path, RunConfig(run_id=run_id, output_dir=str(run_dir)))
-            write_class_weights(paths.class_weights_path, TARGET_LABELS)
+            class_weights = build_class_weights_payload(
+                target_labels=TARGET_LABELS,
+                train_positive_counts={label: 2 for label in TARGET_LABELS},
+                train_negative_counts={label: 6 for label in TARGET_LABELS},
+            )
+            write_class_weights(paths.class_weights_path, class_weights)
             history = pd.DataFrame(
                 [
                     {
@@ -106,6 +120,10 @@ class DenseNetVisualizationDataTests(unittest.TestCase):
             self.assertEqual(artifacts.config["run_id"], run_id)
             self.assertEqual(artifacts.target_labels, TARGET_LABELS)
             self.assertEqual(len(artifacts.predictions_test), 4)
+
+            write_class_weights(paths.class_weights_path, {"target_label_order": TARGET_LABELS})
+            with self.assertRaisesRegex(ValueError, "missing required keys"):
+                load_visualization_artifacts(run_dir, labels_path)
 
 
 if __name__ == "__main__":

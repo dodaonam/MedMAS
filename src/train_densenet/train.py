@@ -9,9 +9,9 @@ import numpy as np
 import pandas as pd
 
 from .artifacts import (
-    SELECTED_POS_WEIGHTS,
     TARGET_LABELS,
     RunConfig,
+    build_class_weights_payload_from_manifest,
     create_run_id,
     default_training_output_dir,
     ensure_artifact_tree,
@@ -19,6 +19,7 @@ from .artifacts import (
     label_slug,
     resolve_artifact_paths,
     save_json,
+    selected_pos_weights_from_payload,
     write_class_weights,
     write_run_config,
 )
@@ -93,9 +94,9 @@ def resolve_device(device: str | None = None) -> Any:
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def create_criterion(device: Any) -> Any:
+def create_criterion(device: Any, pos_weights: dict[str, float], labels: list[str]) -> Any:
     _require_torch()
-    weights = torch.tensor([SELECTED_POS_WEIGHTS[label] for label in TARGET_LABELS], dtype=torch.float32, device=device)
+    weights = torch.tensor([pos_weights[label] for label in labels], dtype=torch.float32, device=device)
     return torch.nn.BCEWithLogitsLoss(pos_weight=weights)
 
 
@@ -151,7 +152,7 @@ def build_dataloaders(config: TrainingConfig, labels: list[str]) -> dict[str, An
     }
 
 
-def run_stage0_smoke(model: Any, dataloader: Any, criterion: Any, device: Any) -> None:
+def run_stage0_smoke(model: Any, dataloader: Any, criterion: Any, device: Any, labels: list[str]) -> None:
     _require_torch()
     model.train()
     images, targets, _metadata = next(iter(dataloader))
@@ -161,7 +162,7 @@ def run_stage0_smoke(model: Any, dataloader: Any, criterion: Any, device: Any) -
     assert tuple(images.shape[1:]) == (3, 224, 224)
     assert images.dtype == torch.float32
     assert targets.ndim == 2
-    assert targets.shape[1] == 6
+    assert targets.shape[1] == len(labels)
     assert targets.dtype == torch.float32
     logits = model(images)
     assert logits.shape == targets.shape
@@ -257,7 +258,9 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
     paths = resolve_artifact_paths(config.output_dir)
     ensure_artifact_tree(paths)
     run_id = create_run_id(config.seed)
-    write_class_weights(paths.class_weights_path, labels)
+    manifest = load_split_manifest(config.manifest_path, labels)
+    class_weights_payload = build_class_weights_payload_from_manifest(manifest, labels)
+    write_class_weights(paths.class_weights_path, class_weights_payload)
     run_config = RunConfig(
         run_id=run_id,
         output_dir=str(paths.output_dir),
@@ -272,9 +275,10 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
 
     dataloaders = build_dataloaders(config, labels)
     model = DenseNet121CNNHead(num_classes=len(labels)).to(device)
-    criterion = create_criterion(device)
+    selected_pos_weights = selected_pos_weights_from_payload(class_weights_payload, labels)
+    criterion = create_criterion(device, selected_pos_weights, labels)
     configure_stage1(model)
-    run_stage0_smoke(model, dataloaders["train"], criterion, device)
+    run_stage0_smoke(model, dataloaders["train"], criterion, device, labels)
 
     history: list[dict[str, Any]] = []
     best_metric = -np.inf

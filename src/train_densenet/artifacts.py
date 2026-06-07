@@ -21,24 +21,6 @@ TARGET_LABELS: list[str] = [
 
 DISEASE_LABELS: list[str] = TARGET_LABELS[1:]
 
-RAW_POS_WEIGHTS: dict[str, float] = {
-    "No Finding": 0.68,
-    "Infiltration": 4.41,
-    "Effusion": 6.52,
-    "Atelectasis": 8.79,
-    "Nodule": 15.13,
-    "Mass": 16.91,
-}
-
-SELECTED_POS_WEIGHTS: dict[str, float] = {
-    "No Finding": 1.00,
-    "Infiltration": 4.41,
-    "Effusion": 6.52,
-    "Atelectasis": 8.79,
-    "Nodule": 10.00,
-    "Mass": 10.00,
-}
-
 
 def label_slug(label: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "_", label.strip().lower())
@@ -153,15 +135,66 @@ def write_run_config(path: Path, config: RunConfig) -> None:
     save_json(path, config.to_dict())
 
 
-def write_class_weights(path: Path, target_labels: list[str] | None = None) -> None:
+def select_pos_weights(raw_pos_weights: dict[str, float], target_labels: list[str] | None = None) -> dict[str, float]:
     labels = target_labels or TARGET_LABELS
-    payload = {
-        "target_label_order": labels,
-        "raw_train_only_pos_weight": {label: RAW_POS_WEIGHTS[label] for label in labels},
-        "selected_clipped_pos_weight": {label: SELECTED_POS_WEIGHTS[label] for label in labels},
-        "selection_rule": "No Finding set to 1.00; rare disease labels clipped at 10.00",
+    selected: dict[str, float] = {}
+    for label in labels:
+        raw_value = float(raw_pos_weights[label])
+        if label == "No Finding":
+            selected[label] = max(raw_value, 1.0)
+        else:
+            selected[label] = min(raw_value, 10.0)
+    return selected
+
+
+def build_class_weights_payload(
+    *,
+    target_labels: list[str],
+    train_positive_counts: dict[str, int],
+    train_negative_counts: dict[str, int],
+) -> dict[str, Any]:
+    raw_pos_weights: dict[str, float] = {}
+    for label in target_labels:
+        positives = int(train_positive_counts[label])
+        negatives = int(train_negative_counts[label])
+        if positives <= 0:
+            raise ValueError(f"Cannot compute pos_weight for {label!r}: train split has no positive samples.")
+        raw_pos_weights[label] = negatives / positives
+    selected = select_pos_weights(raw_pos_weights, target_labels)
+    return {
+        "target_label_order": target_labels,
+        "train_positive_counts": train_positive_counts,
+        "train_negative_counts": train_negative_counts,
+        "raw_train_only_pos_weight": raw_pos_weights,
+        "selected_clipped_pos_weight": selected,
+        "selection_rule": "Computed from train split only; No Finding floored at 1.00; disease labels capped at 10.00",
     }
+
+
+def build_class_weights_payload_from_manifest(manifest: Any, target_labels: list[str]) -> dict[str, Any]:
+    train_frame = manifest.loc[manifest["split"].astype(str) == "train"]
+    if train_frame.empty:
+        raise ValueError("Cannot compute class weights: train split is empty.")
+    positive_counts = train_frame[target_labels].sum(axis=0).astype(int).to_dict()
+    negative_counts = (len(train_frame) - train_frame[target_labels].sum(axis=0)).astype(int).to_dict()
+    return build_class_weights_payload(
+        target_labels=target_labels,
+        train_positive_counts={label: int(positive_counts[label]) for label in target_labels},
+        train_negative_counts={label: int(negative_counts[label]) for label in target_labels},
+    )
+
+
+def write_class_weights(path: Path, payload: dict[str, Any]) -> None:
     save_json(path, payload)
+
+
+def selected_pos_weights_from_payload(payload: dict[str, Any], target_labels: list[str] | None = None) -> dict[str, float]:
+    labels = target_labels or TARGET_LABELS
+    weights = payload["selected_clipped_pos_weight"]
+    missing = [label for label in labels if label not in weights]
+    if missing:
+        raise ValueError(f"Missing selected pos_weight values for labels: {missing}")
+    return {label: float(weights[label]) for label in labels}
 
 
 def slug_columns(prefix: str, labels: list[str]) -> list[str]:

@@ -12,7 +12,7 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 
-from train_densenet.artifacts import SELECTED_POS_WEIGHTS, TARGET_LABELS
+from train_densenet.artifacts import TARGET_LABELS
 
 
 SPLITS = ["train", "val", "test"]
@@ -79,7 +79,7 @@ def plot_train_pos_weight_by_label(
 ) -> Path:
     target_labels = labels or TARGET_LABELS
     raw = class_weights.get("raw_train_only_pos_weight", {})
-    used = class_weights.get("selected_clipped_pos_weight", SELECTED_POS_WEIGHTS)
+    used = class_weights.get("selected_clipped_pos_weight", {})
     fig, ax = plt.subplots(figsize=(9, 4.5))
     x = np.arange(len(target_labels))
     ax.bar(x - 0.18, [float(raw.get(label, np.nan)) for label in target_labels], width=0.36, label="raw")
