@@ -22,6 +22,8 @@ def generate_artifacts(
     initial_start: int = 0,
     initial_end: int = 100,
     fallback_end: int = 1000,
+    train_frac: float = 0.70,
+    val_frac: float = 0.15,
 ) -> dict[str, object]:
     paths = resolve_paths(start or ROOT, artifacts_dir=artifacts_dir)
     ensure_workspace(paths)
@@ -34,6 +36,8 @@ def generate_artifacts(
         initial_start=initial_start,
         initial_end=initial_end,
         fallback_end=fallback_end,
+        train_frac=train_frac,
+        val_frac=val_frac,
     )
     split_ok, split_diagnostics = validate_split(split_result.manifest, TARGET_LABELS)
     if not split_ok:
@@ -48,7 +52,14 @@ def generate_artifacts(
         TARGET_LABELS,
     )
 
-    write_preprocess_config(paths.config_path)
+    write_preprocess_config(
+        paths.config_path,
+        train_frac=train_frac,
+        val_frac=val_frac,
+        initial_start=initial_start,
+        initial_end=initial_end,
+        fallback_end=fallback_end,
+    )
     write_target_labels(paths.target_labels_path, TARGET_LABELS)
     manifest_all.to_csv(paths.manifest_all_path, index=False)
     manifest_filtered.to_csv(paths.manifest_filtered_path, index=False)
@@ -88,6 +99,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--initial-start", type=int, default=0, help="First seed to try.")
     parser.add_argument("--initial-end", type=int, default=100, help="Initial seed range end, inclusive.")
     parser.add_argument("--fallback-end", type=int, default=1000, help="Fallback seed range end, inclusive.")
+    parser.add_argument("--train-frac", type=float, default=0.70, help="Patient-level train split fraction.")
+    parser.add_argument("--val-frac", type=float, default=0.15, help="Patient-level validation split fraction.")
     return parser
 
 
@@ -98,6 +111,8 @@ def main(argv: list[str] | None = None) -> int:
         initial_start=args.initial_start,
         initial_end=args.initial_end,
         fallback_end=args.fallback_end,
+        train_frac=args.train_frac,
+        val_frac=args.val_frac,
     )
 
     print("Generated preprocess artifacts")

@@ -21,6 +21,13 @@ def assign_patient_split(
     train_frac: float = 0.70,
     val_frac: float = 0.15,
 ) -> pd.DataFrame:
+    if not 0 < train_frac < 1:
+        raise ValueError(f"train_frac must be between 0 and 1, got {train_frac}")
+    if not 0 < val_frac < 1:
+        raise ValueError(f"val_frac must be between 0 and 1, got {val_frac}")
+    if train_frac + val_frac >= 1:
+        raise ValueError(f"train_frac + val_frac must be less than 1, got {train_frac + val_frac}")
+
     rng = np.random.default_rng(seed)
     patients = df["Patient ID"].drop_duplicates().to_numpy()
     rng.shuffle(patients)
@@ -90,11 +97,13 @@ def search_patient_split(
     initial_start: int = 0,
     initial_end: int = 100,
     fallback_end: int = 1000,
+    train_frac: float = 0.70,
+    val_frac: float = 0.15,
 ) -> SplitSearchResult:
     targets = target_labels or TARGET_LABELS
     diagnostics: list[dict[str, object]] = []
     for seed in range(initial_start, fallback_end + 1):
-        split_manifest = assign_patient_split(df, seed)
+        split_manifest = assign_patient_split(df, seed, train_frac=train_frac, val_frac=val_frac)
         passes, seed_diagnostics = validate_split(split_manifest, targets)
         seed_diagnostics = {"seed": seed, **seed_diagnostics}
         diagnostics.append(seed_diagnostics)

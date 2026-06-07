@@ -111,15 +111,24 @@ def build_manifest_filtered(manifest_all: pd.DataFrame) -> pd.DataFrame:
     return filtered
 
 
-def write_preprocess_config(path: Path) -> None:
+def write_preprocess_config(
+    path: Path,
+    *,
+    train_frac: float = 0.70,
+    val_frac: float = 0.15,
+    initial_start: int = 0,
+    initial_end: int = 100,
+    fallback_end: int = 1000,
+) -> None:
+    test_frac = 1.0 - train_frac - val_frac
     config = {
         "phase": "filter_and_split_only",
         "source_package": "preprocess_image",
         "workspace": "artifacts/preprocess",
         "target_labels": TARGET_LABELS,
-        "split_ratio": {"train": 0.70, "val": 0.15, "test": 0.15},
+        "split_ratio": {"train": train_frac, "val": val_frac, "test": test_frac},
         "split_unit": "Patient ID",
-        "seed_search": {"initial_start": 0, "initial_end": 100, "fallback_end": 1000},
+        "seed_search": {"initial_start": initial_start, "initial_end": initial_end, "fallback_end": fallback_end},
         "keep_rule": "at_least_one_target_label",
         "drop_rule": "out_of_scope_only",
     }

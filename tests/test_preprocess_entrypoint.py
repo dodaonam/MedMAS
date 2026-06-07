@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import sys
 import tempfile
 import unittest
@@ -25,9 +26,8 @@ class PreprocessEntrypointTests(unittest.TestCase):
     def test_entrypoint_generates_required_artifacts(self) -> None:
         module = load_entrypoint_module()
         with tempfile.TemporaryDirectory() as tmp:
-            summary = module.generate_artifacts(artifacts_dir=Path(tmp))
+            summary = module.generate_artifacts(artifacts_dir=Path(tmp), train_frac=0.60, val_frac=0.20)
 
-            self.assertEqual(summary["selected_seed"], 0)
             self.assertEqual(summary["rows_all"], 5606)
             self.assertEqual(summary["rows_filtered"], 5101)
 
@@ -48,6 +48,9 @@ class PreprocessEntrypointTests(unittest.TestCase):
                 artifact_path = Path(tmp) / relative_path
                 self.assertTrue(artifact_path.exists(), artifact_path)
                 self.assertGreater(artifact_path.stat().st_size, 0)
+
+            config = json.loads((Path(tmp) / "preprocess_config.json").read_text(encoding="utf-8"))
+            self.assertEqual(config["split_ratio"], {"train": 0.60, "val": 0.20, "test": 0.20})
 
 
 if __name__ == "__main__":

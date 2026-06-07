@@ -10,7 +10,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from preprocess_image.manifest import build_manifest_all, build_manifest_filtered
 from preprocess_image.paths import resolve_paths
-from preprocess_image.split import patient_overlap_matrix, search_patient_split, target_counts_by_split, validate_split
+from preprocess_image.split import assign_patient_split, patient_overlap_matrix, search_patient_split, target_counts_by_split, validate_split
 from preprocess_image.targets import TARGET_LABELS
 
 
@@ -37,6 +37,17 @@ class PreprocessSplitTests(unittest.TestCase):
     def test_all_targets_exist_in_each_split(self) -> None:
         counts = target_counts_by_split(self.split_manifest, TARGET_LABELS)
         self.assertTrue((counts[TARGET_LABELS] > 0).all().all())
+
+    def test_patient_split_accepts_custom_ratios(self) -> None:
+        frame = self.split_manifest.drop(columns=["split"]).drop_duplicates("Patient ID").head(10).copy()
+        split = assign_patient_split(frame, seed=0, train_frac=0.60, val_frac=0.20)
+        patient_counts = split.groupby("split")["Patient ID"].nunique().to_dict()
+
+        self.assertEqual(patient_counts, {"test": 2, "train": 6, "val": 2})
+
+    def test_patient_split_rejects_invalid_ratios(self) -> None:
+        with self.assertRaisesRegex(ValueError, "less than 1"):
+            assign_patient_split(self.split_manifest, seed=0, train_frac=0.80, val_frac=0.20)
 
 
 if __name__ == "__main__":
