@@ -34,6 +34,7 @@ from .model import (
     stage1_optimizer_parameters,
     stage2_optimizer_parameters,
 )
+from .progress import ProgressBar
 from .thresholds import select_validation_thresholds, thresholds_by_label
 from .transforms import build_eval_transform, build_train_transform
 
@@ -180,26 +181,31 @@ def train_one_epoch(
     optimizer: Any,
     device: Any,
     use_amp: bool,
+    progress_desc: str,
 ) -> float:
     _require_torch()
     model.train()
     set_backbone_batchnorm_eval(model)
     total_loss = 0.0
     total_rows = 0
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp and device.type == "cuda")
-    for images, targets, _metadata in dataloader:
-        images = images.to(device)
-        targets = targets.to(device)
-        optimizer.zero_grad(set_to_none=True)
-        with torch.cuda.amp.autocast(enabled=use_amp and device.type == "cuda"):
-            logits = model(images)
-            loss = criterion(logits, targets)
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        batch_size = int(images.shape[0])
-        total_loss += float(loss.detach().cpu()) * batch_size
-        total_rows += batch_size
+    amp_enabled = use_amp and device.type == "cuda"
+    amp_device_type = "cuda" if device.type == "cuda" else "cpu"
+    scaler = torch.amp.GradScaler(amp_device_type, enabled=amp_enabled)
+    with ProgressBar(total=len(dataloader), desc=progress_desc) as progress:
+        for images, targets, _metadata in dataloader:
+            images = images.to(device)
+            targets = targets.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            with torch.amp.autocast(amp_device_type, enabled=amp_enabled):
+                logits = model(images)
+                loss = criterion(logits, targets)
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+            batch_size = int(images.shape[0])
+            total_loss += float(loss.detach().cpu()) * batch_size
+            total_rows += batch_size
+            progress.update(loss=total_loss / max(total_rows, 1))
     return total_loss / max(total_rows, 1)
 
 
@@ -210,6 +216,7 @@ def evaluate_loss(
     criterion: Any,
     device: Any,
     labels: list[str],
+    progress_desc: str,
 ) -> tuple[float, dict[str, Any]]:
     _require_torch()
     model.eval()
@@ -218,17 +225,19 @@ def evaluate_loss(
     true_batches: list[np.ndarray] = []
     prob_batches: list[np.ndarray] = []
     with torch.no_grad():
-        for images, targets, _metadata in dataloader:
-            images = images.to(device)
-            targets = targets.to(device)
-            logits = model(images)
-            loss = criterion(logits, targets)
-            probabilities = torch.sigmoid(logits)
-            batch_size = int(images.shape[0])
-            total_loss += float(loss.detach().cpu()) * batch_size
-            total_rows += batch_size
-            true_batches.append(targets.detach().cpu().numpy())
-            prob_batches.append(probabilities.detach().cpu().numpy())
+        with ProgressBar(total=len(dataloader), desc=progress_desc) as progress:
+            for images, targets, _metadata in dataloader:
+                images = images.to(device)
+                targets = targets.to(device)
+                logits = model(images)
+                loss = criterion(logits, targets)
+                probabilities = torch.sigmoid(logits)
+                batch_size = int(images.shape[0])
+                total_loss += float(loss.detach().cpu()) * batch_size
+                total_rows += batch_size
+                true_batches.append(targets.detach().cpu().numpy())
+                prob_batches.append(probabilities.detach().cpu().numpy())
+                progress.update(loss=total_loss / max(total_rows, 1))
     y_true = np.concatenate(true_batches, axis=0)
     y_prob = np.concatenate(prob_batches, axis=0)
     default_thresholds = {label: 0.5 for label in labels}
@@ -248,6 +257,34 @@ def _current_lrs(optimizer: Any) -> dict[str, float | None]:
         elif name == "denseblock4_norm5":
             result["learning_rate_denseblock4_norm5"] = float(group["lr"])
     return result
+
+
+def _format_lr(value: float | None) -> str:
+    return "NA" if value is None else f"{value:.2e}"
+
+
+def _print_epoch_summary(
+    *,
+    epoch: int,
+    train_loss: float,
+    val_loss: float,
+    val_metrics: dict[str, Any],
+    lrs: dict[str, float | None],
+    improved: bool,
+    patience_counter: int | None = None,
+) -> None:
+    patience_suffix = "" if patience_counter is None else f" patience={patience_counter}"
+    print(
+        "Epoch "
+        f"{epoch} summary: train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
+        f"val_disease_macro_AP={val_metrics['disease_macro_average_precision'] or 0.0:.4f} "
+        f"val_disease_macro_AUROC={val_metrics['disease_macro_auroc'] or 0.0:.4f} "
+        f"head_lr={_format_lr(lrs.get('learning_rate_cnn_head'))} "
+        f"backbone_lr={_format_lr(lrs.get('learning_rate_denseblock4_norm5'))} "
+        f"checkpoint={'best' if improved else 'no'}"
+        f"{patience_suffix}",
+        flush=True,
+    )
 
 
 def train_model(config: TrainingConfig) -> dict[str, Any]:
@@ -293,6 +330,7 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="max", factor=0.5, patience=2)
     for _ in range(config.stage1_epochs):
         global_epoch += 1
+        print(f"Epoch {global_epoch} | Stage 1/{config.stage1_epochs} cnn_head_only", flush=True)
         configure_stage1(model)
         train_loss = train_one_epoch(
             model=model,
@@ -301,6 +339,7 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
             optimizer=optimizer,
             device=device,
             use_amp=config.use_amp,
+            progress_desc=f"train e{global_epoch}",
         )
         val_loss, val_metrics = evaluate_loss(
             model=model,
@@ -308,6 +347,7 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
             criterion=criterion,
             device=device,
             labels=labels,
+            progress_desc=f"val   e{global_epoch}",
         )
         scheduler.step(val_metrics["disease_macro_average_precision"] or 0.0)
         lrs = _current_lrs(optimizer)
@@ -328,12 +368,23 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
         )
         metric = val_metrics["disease_macro_average_precision"] or -np.inf
         auroc = val_metrics["disease_macro_auroc"] or -np.inf
-        if metric > best_metric or (metric == best_metric and (auroc > best_tiebreaker_auroc or val_loss < best_tiebreaker_loss)):
+        improved = metric > best_metric or (
+            metric == best_metric and (auroc > best_tiebreaker_auroc or val_loss < best_tiebreaker_loss)
+        )
+        if improved:
             best_metric = metric
             best_tiebreaker_auroc = auroc
             best_tiebreaker_loss = val_loss
             best_epoch = global_epoch
             torch.save(model.state_dict(), paths.checkpoint_best_path)
+        _print_epoch_summary(
+            epoch=global_epoch,
+            train_loss=train_loss,
+            val_loss=val_loss,
+            val_metrics=val_metrics,
+            lrs=lrs,
+            improved=improved,
+        )
 
     stage2_start_epoch = global_epoch + 1
     run_config.stage2_start_epoch = stage2_start_epoch
@@ -351,6 +402,7 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
     patience_counter = 0
     for stage2_epoch in range(1, config.stage2_epochs + 1):
         global_epoch += 1
+        print(f"Epoch {global_epoch} | Stage 2/{config.stage2_epochs} denseblock4_norm5_finetune", flush=True)
         configure_stage2(model)
         train_loss = train_one_epoch(
             model=model,
@@ -359,6 +411,7 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
             optimizer=optimizer,
             device=device,
             use_amp=config.use_amp,
+            progress_desc=f"train e{global_epoch}",
         )
         val_loss, val_metrics = evaluate_loss(
             model=model,
@@ -366,6 +419,7 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
             criterion=criterion,
             device=device,
             labels=labels,
+            progress_desc=f"val   e{global_epoch}",
         )
         scheduler.step(val_metrics["disease_macro_average_precision"] or 0.0)
         lrs = _current_lrs(optimizer)
@@ -397,7 +451,21 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
             torch.save(model.state_dict(), paths.checkpoint_best_path)
         else:
             patience_counter += 1
+        _print_epoch_summary(
+            epoch=global_epoch,
+            train_loss=train_loss,
+            val_loss=val_loss,
+            val_metrics=val_metrics,
+            lrs=lrs,
+            improved=improved,
+            patience_counter=patience_counter,
+        )
         if stage2_epoch >= config.stage2_min_epochs_before_early_stop and patience_counter >= config.early_stopping_patience:
+            print(
+                "Early stopping: "
+                f"stage2_epoch={stage2_epoch} patience={patience_counter}/{config.early_stopping_patience}",
+                flush=True,
+            )
             break
 
     pd.DataFrame(history).to_csv(paths.training_history_path, index=False)
@@ -409,14 +477,31 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
         thresholds={label: 0.5 for label in labels},
         labels=labels,
         run_id=run_id,
+        progress_desc="infer val thresholds",
     )
     y_true = val_frame_05[[f"true_{label_slug(label)}" for label in labels]].to_numpy(dtype=int)
     y_prob = val_frame_05[[f"prob_{label_slug(label)}" for label in labels]].to_numpy(dtype=float)
     thresholds_payload = select_validation_thresholds(y_true, y_prob, labels=labels, run_id=run_id)
     save_json(paths.thresholds_path, thresholds_payload)
     selected_thresholds = thresholds_by_label(thresholds_payload, labels)
-    val_frame = run_inference(model, dataloaders["val"], device=device, thresholds=selected_thresholds, labels=labels, run_id=run_id)
-    test_frame = run_inference(model, dataloaders["test"], device=device, thresholds=selected_thresholds, labels=labels, run_id=run_id)
+    val_frame = run_inference(
+        model,
+        dataloaders["val"],
+        device=device,
+        thresholds=selected_thresholds,
+        labels=labels,
+        run_id=run_id,
+        progress_desc="infer val final",
+    )
+    test_frame = run_inference(
+        model,
+        dataloaders["test"],
+        device=device,
+        thresholds=selected_thresholds,
+        labels=labels,
+        run_id=run_id,
+        progress_desc="infer test final",
+    )
     val_frame.to_csv(paths.predictions_val_path, index=False)
     test_frame.to_csv(paths.predictions_test_path, index=False)
     save_json(paths.metrics_val_path, evaluate_prediction_frame(val_frame, labels=labels, run_id=run_id))

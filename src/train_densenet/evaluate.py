@@ -8,6 +8,7 @@ import pandas as pd
 
 from .artifacts import TARGET_LABELS, label_slug
 from .metrics import compute_metrics_from_prediction_frame
+from .progress import ProgressBar
 
 try:
     import torch
@@ -77,6 +78,7 @@ def run_inference(
     thresholds: Mapping[str, float],
     labels: list[str] | None = None,
     run_id: str | None = None,
+    progress_desc: str | None = None,
 ) -> pd.DataFrame:
     _require_torch()
     target_labels = labels or TARGET_LABELS
@@ -86,15 +88,17 @@ def run_inference(
     logits_list: list[np.ndarray] = []
     probabilities_list: list[np.ndarray] = []
     with torch.no_grad():
-        for images, targets, metadata in dataloader:
-            images = images.to(device)
-            logits = model(images).detach().cpu()
-            probabilities = torch.sigmoid(logits)
-            batch_size = int(logits.shape[0])
-            metadata_rows.extend(_metadata_batch_to_rows(metadata, batch_size))
-            targets_list.append(targets.detach().cpu().numpy())
-            logits_list.append(logits.numpy())
-            probabilities_list.append(probabilities.numpy())
+        with ProgressBar(total=len(dataloader), desc=progress_desc or "infer", enabled=progress_desc is not None) as progress:
+            for images, targets, metadata in dataloader:
+                images = images.to(device)
+                logits = model(images).detach().cpu()
+                probabilities = torch.sigmoid(logits)
+                batch_size = int(logits.shape[0])
+                metadata_rows.extend(_metadata_batch_to_rows(metadata, batch_size))
+                targets_list.append(targets.detach().cpu().numpy())
+                logits_list.append(logits.numpy())
+                probabilities_list.append(probabilities.numpy())
+                progress.update()
     return build_prediction_frame(
         metadata_rows=metadata_rows,
         targets=np.concatenate(targets_list, axis=0),
