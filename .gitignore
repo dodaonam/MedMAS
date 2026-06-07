@@ -216,3 +216,12 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+.omx/
+.claude/
+.env
+data/raw/
+data/proccessed/
+data/chest_x-ray/
+artifacts/
+plans/
+NOTE.md

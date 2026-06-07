@@ -1,0 +1,62 @@
+from __future__ import annotations
+
+from typing import Any
+
+try:
+    import torch
+    from torchvision import transforms
+except ModuleNotFoundError:  # pragma: no cover - exercised only on machines without torchvision
+    torch = None  # type: ignore[assignment]
+    transforms = None  # type: ignore[assignment]
+
+
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
+
+
+def _require_torchvision() -> None:
+    if transforms is None:
+        raise ModuleNotFoundError("torchvision is required for DenseNet image transforms.")
+
+
+def build_train_transform() -> Any:
+    _require_torchvision()
+    return transforms.Compose(
+        [
+            transforms.Resize(256),
+            transforms.RandomResizedCrop(224, scale=(0.90, 1.00), ratio=(0.97, 1.03)),
+            transforms.RandomRotation(degrees=5),
+            transforms.RandomAffine(degrees=0, translate=(0.02, 0.02)),
+            transforms.ColorJitter(brightness=0.05, contrast=0.05),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ]
+    )
+
+
+def build_eval_transform() -> Any:
+    _require_torchvision()
+    return transforms.Compose(
+        [
+            transforms.Resize(256),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+        ]
+    )
+
+
+def build_transform(split: str) -> Any:
+    if split == "train":
+        return build_train_transform()
+    if split in {"val", "test"}:
+        return build_eval_transform()
+    raise ValueError(f"Unsupported split: {split!r}")
+
+
+def denormalize_image_tensor(image_tensor: Any) -> Any:
+    if torch is None:
+        raise ModuleNotFoundError("PyTorch is required to denormalize image tensors.")
+    mean = torch.tensor(IMAGENET_MEAN, dtype=image_tensor.dtype, device=image_tensor.device).view(3, 1, 1)
+    std = torch.tensor(IMAGENET_STD, dtype=image_tensor.dtype, device=image_tensor.device).view(3, 1, 1)
+    return (image_tensor * std + mean).clamp(0, 1)
