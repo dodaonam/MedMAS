@@ -20,6 +20,7 @@ def generate_visualization_report(
     root: Path,
     include_gradcam: bool = False,
     device: str | None = None,
+    gradcam_target_layer: str = "cnn_head_final_conv",
 ) -> list[Path]:
     artifacts = load_visualization_artifacts(run_dir, target_labels_path)
     manifest = load_manifest_for_visualization(manifest_path, artifacts.target_labels)
@@ -27,7 +28,8 @@ def generate_visualization_report(
     paths.extend(
         create_data_plots(
             manifest=manifest,
-            class_weights=artifacts.class_weights,
+            loss_config=artifacts.loss_config,
+            root=root,
             figures_dir=artifacts.figures_dir,
             labels=artifacts.target_labels,
         )
@@ -67,12 +69,13 @@ def generate_visualization_report(
     if include_gradcam:
         paths.extend(
             create_gradcam_report(
-                checkpoint_path=run_dir / "checkpoint_best.pt",
+                checkpoint_path=artifacts.run_dir / "checkpoint_best.pt",
                 predictions=artifacts.predictions_test,
                 figures_dir=artifacts.figures_dir,
                 root=root,
                 labels=artifacts.target_labels,
                 device_name=device,
+                target_layer_name=gradcam_target_layer,
             )
         )
     return paths

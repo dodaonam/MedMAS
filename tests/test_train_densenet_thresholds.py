@@ -10,7 +10,7 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from train_densenet.artifacts import TARGET_LABELS
+from train_densenet.artifacts import DISEASE_LABELS
 from train_densenet.thresholds import select_threshold_for_label, select_validation_thresholds, threshold_grid
 
 
@@ -35,25 +35,29 @@ class DenseNetThresholdTests(unittest.TestCase):
     def test_multilabel_threshold_payload_has_required_keys(self) -> None:
         y_true = np.array(
             [
-                [1, 0, 1, 0, 0, 0],
-                [0, 1, 0, 0, 0, 0],
-                [0, 1, 1, 1, 0, 0],
-                [1, 0, 0, 1, 0, 0],
+                [0, 1, 0, 0, 0],
+                [1, 0, 0, 0, 0],
+                [1, 1, 1, 0, 0],
+                [0, 0, 1, 0, 0],
             ]
         )
         y_prob = np.array(
             [
-                [0.9, 0.2, 0.8, 0.1, 0.2, 0.3],
-                [0.2, 0.9, 0.3, 0.3, 0.1, 0.2],
-                [0.3, 0.8, 0.7, 0.9, 0.2, 0.3],
-                [0.8, 0.2, 0.2, 0.8, 0.1, 0.2],
+                [0.2, 0.8, 0.1, 0.2, 0.3],
+                [0.9, 0.3, 0.3, 0.1, 0.2],
+                [0.8, 0.7, 0.9, 0.2, 0.3],
+                [0.2, 0.2, 0.8, 0.1, 0.2],
             ]
         )
-        payload = select_validation_thresholds(y_true, y_prob, TARGET_LABELS, run_id="unit")
+        payload = select_validation_thresholds(y_true, y_prob, DISEASE_LABELS, run_id="unit")
         self.assertEqual(payload["run_id"], "unit")
         self.assertEqual(payload["threshold_grid"], "np.arange(0.05, 0.951, 0.01)")
-        self.assertEqual(set(payload["thresholds"]), set(TARGET_LABELS))
-        self.assertIn("tp", payload["per_label"]["No Finding"])
+        self.assertEqual(set(payload["thresholds"]), set(DISEASE_LABELS))
+        self.assertIn("tp", payload["per_label"]["Mass"])
+
+    def test_threshold_payload_rejects_no_finding_output(self) -> None:
+        with self.assertRaisesRegex(ValueError, "No Finding"):
+            select_validation_thresholds([[0, 1]], [[0.2, 0.8]], ["No Finding", "Mass"], run_id="unit")
 
 
 if __name__ == "__main__":

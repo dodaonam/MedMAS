@@ -5,7 +5,7 @@ from typing import Any
 
 import numpy as np
 
-from .artifacts import DISEASE_LABELS, TARGET_LABELS, label_slug
+from .artifacts import DISEASE_LABELS, label_slug
 
 
 def _as_1d_float(values: Sequence[float] | np.ndarray) -> np.ndarray:
@@ -148,6 +148,33 @@ def _mean_defined(values: Sequence[float | None]) -> float | None:
     return float(np.mean(defined))
 
 
+def checkpoint_candidate_improved(
+    *,
+    candidate_ap: float | None,
+    best_ap: float,
+    min_delta: float,
+    has_best: bool,
+    candidate_auroc: float | None = None,
+    best_auroc: float | None = None,
+    candidate_val_loss: float | None = None,
+    best_val_loss: float | None = None,
+) -> bool:
+    if not has_best:
+        return True
+    if candidate_ap is None:
+        return False
+    threshold = float(best_ap) + float(min_delta)
+    if float(candidate_ap) <= threshold:
+        return False
+    if not np.isclose(float(candidate_ap), threshold, rtol=0.0, atol=1e-12):
+        return True
+    if candidate_auroc is not None and best_auroc is not None and candidate_auroc != best_auroc:
+        return float(candidate_auroc) > float(best_auroc)
+    if candidate_val_loss is not None and best_val_loss is not None and candidate_val_loss != best_val_loss:
+        return float(candidate_val_loss) < float(best_val_loss)
+    return True
+
+
 def _threshold_sequence(thresholds: Mapping[str, float] | Sequence[float], labels: list[str]) -> list[float]:
     if isinstance(thresholds, Mapping):
         return [float(thresholds[label]) for label in labels]
@@ -164,7 +191,9 @@ def compute_multilabel_metrics(
     labels: list[str] | None = None,
     run_id: str | None = None,
 ) -> dict[str, Any]:
-    target_labels = labels or TARGET_LABELS
+    target_labels = labels or DISEASE_LABELS
+    if "No Finding" in target_labels:
+        raise ValueError("Recipe v2 metrics expect disease labels only; `No Finding` must be derived.")
     true = np.asarray(y_true, dtype=int)
     prob = np.asarray(y_prob, dtype=float)
     if true.shape != prob.shape:
@@ -177,32 +206,37 @@ def compute_multilabel_metrics(
     for idx, label in enumerate(target_labels):
         per_label[label] = compute_label_metrics(true[:, idx], prob[:, idx], threshold_values[idx])
 
-    disease_names = [label for label in DISEASE_LABELS if label in per_label]
-    all_counts = {
+    pred = (prob >= np.asarray(threshold_values, dtype=float).reshape(1, -1)).astype(int)
+    disease_counts = {
         "tp": int(sum(per_label[label]["tp"] for label in target_labels)),
         "fp": int(sum(per_label[label]["fp"] for label in target_labels)),
         "tn": int(sum(per_label[label]["tn"] for label in target_labels)),
         "fn": int(sum(per_label[label]["fn"] for label in target_labels)),
     }
-    micro = metrics_from_counts(all_counts)
+    micro = metrics_from_counts(disease_counts)
+    true_no_finding_derived = (np.sum(true, axis=1) == 0).astype(int)
+    pred_no_finding_derived = (np.sum(pred, axis=1) == 0).astype(int)
+    no_finding_counts = confusion_counts(true_no_finding_derived, pred_no_finding_derived)
+    no_finding_metrics = {
+        "positive_count": int(np.sum(true_no_finding_derived == 1)),
+        "negative_count": int(np.sum(true_no_finding_derived == 0)),
+        **no_finding_counts,
+        **metrics_from_counts(no_finding_counts),
+    }
     payload: dict[str, Any] = {
         "run_id": run_id,
         "target_label_order": target_labels,
         "per_label": per_label,
-        "disease_macro_average_precision": _mean_defined([per_label[label]["average_precision"] for label in disease_names]),
-        "disease_macro_auroc": _mean_defined([per_label[label]["auroc"] for label in disease_names]),
-        "disease_macro_f1": _mean_defined([per_label[label]["f1"] for label in disease_names]),
-        "all_label_macro_average_precision": _mean_defined([per_label[label]["average_precision"] for label in target_labels]),
-        "all_label_macro_auroc": _mean_defined([per_label[label]["auroc"] for label in target_labels]),
-        "all_label_macro_f1": _mean_defined([per_label[label]["f1"] for label in target_labels]),
-        "all_label_micro_precision": micro["precision"],
-        "all_label_micro_recall": micro["recall"],
-        "all_label_micro_specificity": micro["specificity"],
-        "all_label_micro_f1": micro["f1"],
-        "micro_counts": all_counts,
+        "disease_macro_average_precision": _mean_defined([per_label[label]["average_precision"] for label in target_labels]),
+        "disease_macro_auroc": _mean_defined([per_label[label]["auroc"] for label in target_labels]),
+        "disease_macro_f1": _mean_defined([per_label[label]["f1"] for label in target_labels]),
+        "disease_micro_precision": micro["precision"],
+        "disease_micro_recall": micro["recall"],
+        "disease_micro_specificity": micro["specificity"],
+        "disease_micro_f1": micro["f1"],
+        "disease_micro_counts": disease_counts,
+        "derived_no_finding_metrics": no_finding_metrics,
     }
-    if target_labels and target_labels[0] == "No Finding":
-        payload["raw_no_finding_metrics"] = per_label["No Finding"]
     return payload
 
 
@@ -221,7 +255,7 @@ def compute_metrics_from_prediction_frame(
     labels: list[str] | None = None,
     run_id: str | None = None,
 ) -> dict[str, Any]:
-    target_labels = labels or TARGET_LABELS
+    target_labels = labels or DISEASE_LABELS
     columns = prediction_columns_for(target_labels)
     true = frame[columns["true"]].to_numpy(dtype=int)
     prob = frame[columns["prob"]].to_numpy(dtype=float)
@@ -229,7 +263,19 @@ def compute_metrics_from_prediction_frame(
         label: float(frame[f"threshold_{label_slug(label)}"].dropna().iloc[0])
         for label in target_labels
     }
-    return compute_multilabel_metrics(true, prob, thresholds, target_labels, run_id=run_id)
+    payload = compute_multilabel_metrics(true, prob, thresholds, target_labels, run_id=run_id)
+    if {"true_no_finding_derived", "pred_no_finding_derived"}.issubset(frame.columns):
+        counts = confusion_counts(
+            frame["true_no_finding_derived"].to_numpy(dtype=int),
+            frame["pred_no_finding_derived"].to_numpy(dtype=int),
+        )
+        payload["derived_no_finding_metrics"] = {
+            "positive_count": int(np.sum(frame["true_no_finding_derived"].to_numpy(dtype=int) == 1)),
+            "negative_count": int(np.sum(frame["true_no_finding_derived"].to_numpy(dtype=int) == 0)),
+            **counts,
+            **metrics_from_counts(counts),
+        }
+    return payload
 
 
 def compute_subgroup_metrics_from_frame(
@@ -238,7 +284,7 @@ def compute_subgroup_metrics_from_frame(
     labels: list[str] | None = None,
     min_positives: int = 20,
 ) -> dict[str, Any]:
-    target_labels = labels or TARGET_LABELS
+    target_labels = labels or DISEASE_LABELS
     result: dict[str, Any] = {"group_column": group_column, "groups": {}}
     columns = prediction_columns_for(target_labels)
     for group_value, group_frame in frame.groupby(group_column, dropna=False):

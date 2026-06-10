@@ -12,7 +12,7 @@ from torchvision.models import DenseNet121_Weights, densenet121
 class DenseNet121CNNHead(nn.Module):
     def __init__(
         self,
-        num_classes: int = 6,
+        num_classes: int = 5,
         weights: DenseNet121_Weights | None = DenseNet121_Weights.IMAGENET1K_V1,
     ) -> None:
         super().__init__()

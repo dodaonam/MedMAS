@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from train_densenet.artifacts import TARGET_LABELS, label_slug
+from train_densenet.artifacts import DISEASE_LABELS, label_slug
 from .plots_data import plot_image_grid_from_paths
 
 
@@ -32,7 +32,7 @@ def create_error_grids(
     labels: list[str] | None = None,
     max_images_per_label: int = 12,
 ) -> list[Path]:
-    target_labels = labels or TARGET_LABELS
+    target_labels = labels or DISEASE_LABELS
     paths: list[Path] = []
     for label in target_labels:
         slug = label_slug(label)

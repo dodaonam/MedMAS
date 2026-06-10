@@ -12,6 +12,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised only on machines wit
     torch = None  # type: ignore[assignment]
     F = None  # type: ignore[assignment]
 
+
 def _require_torch() -> None:
     if torch is None or F is None:
         raise ModuleNotFoundError("PyTorch is required for Grad-CAM generation.")
@@ -61,12 +62,12 @@ def load_model_for_gradcam(
     checkpoint_path: Path,
     *,
     device: Any,
-    num_classes: int = 6,
+    num_classes: int = 5,
 ) -> Any:
     _require_torch()
     from .model import DenseNet121CNNHead
 
-    model = DenseNet121CNNHead(num_classes=num_classes)
+    model = DenseNet121CNNHead(num_classes=num_classes, weights=None)
     state = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(state)
     model.to(device)
@@ -78,3 +79,11 @@ def default_target_layer(model: Any) -> Any:
     from .model import final_cnn_head_conv
 
     return final_cnn_head_conv(model)
+
+
+def target_layer_by_name(model: Any, target_layer_name: str) -> Any:
+    if target_layer_name in {"cnn_head_final_conv", "cnn_head"}:
+        return default_target_layer(model)
+    if target_layer_name in {"backbone.denseblock4", "denseblock4"}:
+        return model.backbone.denseblock4
+    raise ValueError(f"Unsupported Grad-CAM target layer: {target_layer_name!r}")

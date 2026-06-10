@@ -50,8 +50,6 @@ def plot_macro_metric_curves(history: pd.DataFrame, figures_dir: Path) -> Path:
     metric_columns = [
         "val_disease_macro_auroc",
         "val_disease_macro_average_precision",
-        "val_all_label_macro_auroc",
-        "val_all_label_macro_average_precision",
     ]
     fig, ax = plt.subplots(figsize=(9, 4.8))
     for column in metric_columns:
@@ -68,18 +66,18 @@ def plot_macro_metric_curves(history: pd.DataFrame, figures_dir: Path) -> Path:
 def plot_per_label_metric_curves(history: pd.DataFrame, figures_dir: Path) -> Path:
     columns = [column for column in history.columns if column.startswith("val_") and column.endswith("_average_precision")]
     per_label_columns = [
-        column for column in columns if column not in {"val_disease_macro_average_precision", "val_all_label_macro_average_precision"}
+        column for column in columns if column != "val_disease_macro_average_precision"
     ]
     fig, ax = plt.subplots(figsize=(9, 4.8))
     if per_label_columns:
         for column in per_label_columns:
             ax.plot(history["epoch"], history[column], marker="o", label=column.removeprefix("val_"))
     else:
-        ax.text(0.5, 0.5, "per-label metric columns not saved", ha="center", va="center", transform=ax.transAxes)
+        ax.text(0.5, 0.5, "per-disease-label metric columns not saved", ha="center", va="center", transform=ax.transAxes)
     _draw_stage_line(ax, history)
     ax.set_xlabel("epoch")
     ax.set_ylabel("average precision")
-    ax.set_title("Per-label validation metric curves")
+    ax.set_title("Per-disease-label validation metric curves")
     if per_label_columns:
         ax.legend(fontsize=8)
     return _save(fig, figures_dir / "01_training" / "per_label_metric_curves.png")

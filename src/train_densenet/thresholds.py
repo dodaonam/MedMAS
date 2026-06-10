@@ -5,7 +5,7 @@ from typing import Any
 
 import numpy as np
 
-from .artifacts import DISEASE_LABELS, TARGET_LABELS
+from .artifacts import DISEASE_LABELS
 from .metrics import confusion_counts, metrics_from_counts
 
 
@@ -62,7 +62,9 @@ def select_validation_thresholds(
     run_id: str | None = None,
     grid: Sequence[float] | np.ndarray | None = None,
 ) -> dict[str, Any]:
-    target_labels = labels or TARGET_LABELS
+    target_labels = labels or DISEASE_LABELS
+    if "No Finding" in target_labels:
+        raise ValueError("Recipe v2 threshold selection uses disease labels only; `No Finding` is derived.")
     true = np.asarray(y_true, dtype=int)
     prob = np.asarray(y_prob, dtype=float)
     if true.shape != prob.shape:
@@ -87,7 +89,7 @@ def select_validation_thresholds(
 
 
 def thresholds_by_label(threshold_payload: Mapping[str, Any], labels: list[str] | None = None) -> dict[str, float]:
-    target_labels = labels or TARGET_LABELS
+    target_labels = labels or DISEASE_LABELS
     if "thresholds" in threshold_payload:
         source = threshold_payload["thresholds"]
         return {label: float(source[label]) for label in target_labels}

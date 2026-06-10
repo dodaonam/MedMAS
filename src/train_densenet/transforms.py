@@ -19,12 +19,12 @@ def _require_torchvision() -> None:
         raise ModuleNotFoundError("torchvision is required for DenseNet image transforms.")
 
 
-def build_train_transform() -> Any:
+def build_train_transform(*, input_size: int = 320, resize_size: int = 352) -> Any:
     _require_torchvision()
     return transforms.Compose(
         [
-            transforms.Resize(256),
-            transforms.RandomResizedCrop(224, scale=(0.90, 1.00), ratio=(0.97, 1.03)),
+            transforms.Resize(resize_size),
+            transforms.RandomResizedCrop(input_size, scale=(0.90, 1.00), ratio=(0.97, 1.03)),
             transforms.RandomRotation(degrees=5),
             transforms.RandomAffine(degrees=0, translate=(0.02, 0.02)),
             transforms.ColorJitter(brightness=0.05, contrast=0.05),
@@ -34,23 +34,23 @@ def build_train_transform() -> Any:
     )
 
 
-def build_eval_transform() -> Any:
+def build_eval_transform(*, input_size: int = 320, resize_size: int = 352) -> Any:
     _require_torchvision()
     return transforms.Compose(
         [
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
+            transforms.Resize(resize_size),
+            transforms.CenterCrop(input_size),
             transforms.ToTensor(),
             transforms.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
         ]
     )
 
 
-def build_transform(split: str) -> Any:
+def build_transform(split: str, *, input_size: int = 320, resize_size: int = 352) -> Any:
     if split == "train":
-        return build_train_transform()
+        return build_train_transform(input_size=input_size, resize_size=resize_size)
     if split in {"val", "test"}:
-        return build_eval_transform()
+        return build_eval_transform(input_size=input_size, resize_size=resize_size)
     raise ValueError(f"Unsupported split: {split!r}")
 
 

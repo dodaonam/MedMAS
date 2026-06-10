@@ -7,7 +7,7 @@ from typing import Any
 import pandas as pd
 from PIL import Image
 
-from .artifacts import TARGET_LABELS
+from .artifacts import DISEASE_LABELS, TARGET_LABELS
 
 try:
     import torch
@@ -18,7 +18,7 @@ except ModuleNotFoundError:  # pragma: no cover - exercised only on machines wit
     Dataset = object  # type: ignore[assignment,misc]
 
 
-REQUIRED_COLUMNS = [
+REQUIRED_METADATA_COLUMNS = [
     "image_path",
     "split",
     "Patient ID",
@@ -27,8 +27,9 @@ REQUIRED_COLUMNS = [
     "View Position",
     "AgeBin",
     "has_out_of_scope_label",
-    *TARGET_LABELS,
 ]
+
+REQUIRED_COLUMNS = [*REQUIRED_METADATA_COLUMNS, *TARGET_LABELS]
 
 METADATA_COLUMNS = [
     "Image Index",
@@ -39,6 +40,7 @@ METADATA_COLUMNS = [
     "View Position",
     "AgeBin",
     "has_out_of_scope_label",
+    "No Finding",
 ]
 
 
@@ -48,7 +50,7 @@ def _require_torch() -> None:
 
 
 def load_split_manifest(path: Path, target_labels: list[str] | None = None) -> pd.DataFrame:
-    labels = target_labels or TARGET_LABELS
+    labels = target_labels or DISEASE_LABELS
     frame = pd.read_csv(
         path,
         dtype={
@@ -66,8 +68,8 @@ def load_split_manifest(path: Path, target_labels: list[str] | None = None) -> p
 
 
 def validate_manifest_columns(frame: pd.DataFrame, target_labels: list[str] | None = None) -> None:
-    labels = target_labels or TARGET_LABELS
-    required = [column for column in REQUIRED_COLUMNS if column in REQUIRED_COLUMNS[:8] or column in labels]
+    labels = target_labels or DISEASE_LABELS
+    required = [*REQUIRED_METADATA_COLUMNS, "No Finding", *labels]
     missing = [column for column in required if column not in frame.columns]
     if missing:
         raise ValueError(f"Missing required manifest columns: {missing}")
@@ -106,7 +108,7 @@ class ChestXrayMultiLabelDataset(Dataset):  # type: ignore[misc]
         transform: Callable[[Image.Image], Any] | None = None,
     ) -> None:
         _require_torch()
-        self.target_labels = target_labels or TARGET_LABELS
+        self.target_labels = target_labels or DISEASE_LABELS
         validate_manifest_columns(manifest, self.target_labels)
         self.root = root
         self.split = split
