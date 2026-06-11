@@ -25,13 +25,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--device", default=None, help="Example: cuda, cuda:0, or cpu. Defaults to CUDA when available.")
     parser.add_argument("--no-pretrained", action="store_true", help="Do not load ImageNet weights.")
     parser.add_argument("--dry-run-smoke", action="store_true", help="Build data/model and run one forward pass.")
+    parser.add_argument("--finalize-run-dir", type=Path, default=None, help="Only run final val/test export for an existing run.")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        from train_densenet import TrainConfig, smoke_check, train_model
+        from train_densenet import TrainConfig, finalize_run, smoke_check, train_model
     except ModuleNotFoundError as exc:
         raise SystemExit("Missing dependency. Install torch, torchvision, pillow, pandas, and numpy first.") from exc
 
@@ -57,6 +58,16 @@ def main(argv: list[str] | None = None) -> int:
         except ModuleNotFoundError as exc:
             raise SystemExit("Missing dependency. Install torch and torchvision before running DenseNet training.") from exc
         print("DenseNet121 smoke check passed")
+        for key, value in summary.items():
+            print(f"  {key}: {value}")
+        return 0
+
+    if args.finalize_run_dir is not None:
+        try:
+            summary = finalize_run(config, args.finalize_run_dir)
+        except ModuleNotFoundError as exc:
+            raise SystemExit("Missing dependency. Install torch and torchvision before running DenseNet training.") from exc
+        print("DenseNet121 final evaluation export complete")
         for key, value in summary.items():
             print(f"  {key}: {value}")
         return 0

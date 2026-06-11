@@ -26,6 +26,7 @@ from train_densenet import (
     resolve_run_dir,
     save_json,
 )
+import train_densenet.train as train_module
 
 
 class DenseNetSimpleTests(unittest.TestCase):
@@ -85,6 +86,24 @@ class DenseNetSimpleTests(unittest.TestCase):
         self.assertEqual(result["macro_auroc"], 1.0)
         self.assertEqual(average_precision([0, 0], [0.1, 0.2]), None)
         self.assertEqual(auroc([1, 1], [0.8, 0.9]), None)
+
+    def test_checkpoint_load_allows_script_metadata(self) -> None:
+        calls = []
+
+        class FakeTorch:
+            def load(self, *args, **kwargs):  # noqa: ANN001
+                calls.append((args, kwargs))
+                return {"model_state_dict": {}}
+
+        original_torch = train_module.torch
+        train_module.torch = FakeTorch()  # type: ignore[assignment]
+        try:
+            checkpoint = train_module.load_checkpoint(Path("checkpoint_best.pt"), map_location="cpu")
+        finally:
+            train_module.torch = original_torch
+
+        self.assertEqual(checkpoint, {"model_state_dict": {}})
+        self.assertEqual(calls[0][1]["weights_only"], False)
 
 
 if __name__ == "__main__":

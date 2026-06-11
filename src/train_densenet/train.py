@@ -4,7 +4,7 @@ import json
 import random
 import re
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 from PIL import Image
+from tqdm.auto import tqdm
 
 try:
     import torch
@@ -113,6 +114,16 @@ def artifact_paths(run_dir: Path) -> ArtifactPaths:
         metrics_test_path=run_dir / "metrics_test.json",
         figures_dir=run_dir / "figures",
     )
+
+
+def load_checkpoint(path: Path, *, map_location: Any) -> dict[str, Any]:
+    _require_torch()
+    try:
+        return torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError as exc:
+        if "weights_only" not in str(exc):
+            raise
+        return torch.load(path, map_location=map_location)
 
 
 def resolve_run_dir(path: Path) -> Path:
@@ -257,7 +268,7 @@ def train_model(config: TrainConfig) -> dict[str, Any]:
         "target_labels": labels,
         "threshold": config.threshold,
         "best_checkpoint": str(paths.checkpoint_path),
-        "torch_version": getattr(torch, "__version__", None),
+        "torch_version": str(getattr(torch, "__version__", "")),
         "device": str(device),
     }
     save_json(paths.config_path, config_payload)
@@ -267,7 +278,14 @@ def train_model(config: TrainConfig) -> dict[str, Any]:
     best_epoch = 0
     for epoch in range(1, config.epochs + 1):
         start = time.time()
-        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        train_loss = train_one_epoch(
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            device,
+            desc=f"epoch {epoch}/{config.epochs} train",
+        )
         val_loss, val_frame, y_true, y_prob = predict(
             model,
             val_loader,
@@ -276,6 +294,7 @@ def train_model(config: TrainConfig) -> dict[str, Any]:
             labels,
             threshold=config.threshold,
             run_id=run_id,
+            desc=f"epoch {epoch}/{config.epochs} val",
         )
         val_metrics = compute_metrics(y_true, y_prob, labels, threshold=config.threshold, run_id=run_id)
         score = _score_for_checkpoint(val_metrics, val_loss)
@@ -314,7 +333,7 @@ def train_model(config: TrainConfig) -> dict[str, Any]:
             f"val_macro_ap={_fmt_metric(row['val_macro_average_precision'])}"
         )
 
-    checkpoint = torch.load(paths.checkpoint_path, map_location=device)
+    checkpoint = load_checkpoint(paths.checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
     val_loss, val_frame, val_true, val_prob = predict(
         model,
@@ -324,6 +343,7 @@ def train_model(config: TrainConfig) -> dict[str, Any]:
         labels,
         threshold=config.threshold,
         run_id=run_id,
+        desc="best val",
     )
     test_loss, test_frame, test_true, test_prob = predict(
         model,
@@ -333,6 +353,7 @@ def train_model(config: TrainConfig) -> dict[str, Any]:
         labels,
         threshold=config.threshold,
         run_id=run_id,
+        desc="test",
     )
     val_metrics = compute_metrics(val_true, val_prob, labels, threshold=config.threshold, run_id=run_id)
     test_metrics = compute_metrics(test_true, test_prob, labels, threshold=config.threshold, run_id=run_id)
@@ -349,6 +370,71 @@ def train_model(config: TrainConfig) -> dict[str, Any]:
         "run_dir": str(paths.run_dir),
         "best_epoch": best_epoch,
         "best_val_score": best_score,
+        "test_loss": test_loss,
+        "test_macro_average_precision": test_metrics["macro_average_precision"],
+        "test_macro_auroc": test_metrics["macro_auroc"],
+        "test_macro_f1": test_metrics["macro_f1"],
+    }
+
+
+def finalize_run(config: TrainConfig, run_dir: Path) -> dict[str, Any]:
+    _require_torch()
+    paths = artifact_paths(resolve_run_dir(run_dir))
+    run_config = json.loads(paths.config_path.read_text(encoding="utf-8"))
+    run_root = Path(run_config.get("root", config.root))
+    manifest_path = Path(run_config.get("manifest_path", config.manifest_path))
+    target_labels_path = Path(run_config.get("target_labels_path", config.target_labels_path))
+    labels = list(run_config.get("target_labels") or load_target_labels(target_labels_path))
+    device = resolve_device(config.device)
+    run_id = str(run_config["run_id"])
+    threshold = float(run_config.get("threshold", config.threshold))
+    eval_config = replace(
+        config,
+        root=run_root,
+        manifest_path=manifest_path,
+        target_labels_path=target_labels_path,
+        image_size=int(run_config.get("image_size", config.image_size)),
+        threshold=threshold,
+        pretrained=False,
+    )
+    frame = load_manifest(eval_config.manifest_path, labels)
+    _train_loader, val_loader, test_loader = build_dataloaders(eval_config, frame, labels)
+    model = build_model(len(labels), pretrained=False).to(device)
+    checkpoint = load_checkpoint(paths.checkpoint_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=positive_weights(frame, labels).to(device))
+
+    val_loss, val_frame, val_true, val_prob = predict(
+        model,
+        val_loader,
+        criterion,
+        device,
+        labels,
+        threshold=threshold,
+        run_id=run_id,
+        desc="best val",
+    )
+    test_loss, test_frame, test_true, test_prob = predict(
+        model,
+        test_loader,
+        criterion,
+        device,
+        labels,
+        threshold=threshold,
+        run_id=run_id,
+        desc="test",
+    )
+    val_metrics = compute_metrics(val_true, val_prob, labels, threshold=threshold, run_id=run_id)
+    test_metrics = compute_metrics(test_true, test_prob, labels, threshold=threshold, run_id=run_id)
+    val_metrics["loss"] = val_loss
+    test_metrics["loss"] = test_loss
+    val_frame.to_csv(paths.predictions_val_path, index=False)
+    test_frame.to_csv(paths.predictions_test_path, index=False)
+    save_json(paths.metrics_val_path, val_metrics)
+    save_json(paths.metrics_test_path, test_metrics)
+    return {
+        "run_id": run_id,
+        "run_dir": str(paths.run_dir),
         "test_loss": test_loss,
         "test_macro_average_precision": test_metrics["macro_average_precision"],
         "test_macro_auroc": test_metrics["macro_auroc"],
@@ -409,11 +495,12 @@ def build_dataloaders(config: TrainConfig, frame: pd.DataFrame, labels: list[str
     )
 
 
-def train_one_epoch(model: Any, loader: Any, criterion: Any, optimizer: Any, device: Any) -> float:
+def train_one_epoch(model: Any, loader: Any, criterion: Any, optimizer: Any, device: Any, *, desc: str = "train") -> float:
     model.train()
     total_loss = 0.0
     total_rows = 0
-    for images, targets, _metadata in loader:
+    progress = tqdm(loader, desc=desc, total=len(loader), dynamic_ncols=True, leave=False)
+    for images, targets, _metadata in progress:
         images = images.to(device, non_blocking=True)
         targets = targets.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
@@ -424,6 +511,7 @@ def train_one_epoch(model: Any, loader: Any, criterion: Any, optimizer: Any, dev
         batch_size = int(images.shape[0])
         total_loss += float(loss.detach().cpu()) * batch_size
         total_rows += batch_size
+        progress.set_postfix(loss=f"{total_loss / max(total_rows, 1):.4f}")
     return total_loss / max(total_rows, 1)
 
 
@@ -436,6 +524,7 @@ def predict(
     *,
     threshold: float,
     run_id: str,
+    desc: str | None = None,
 ) -> tuple[float, pd.DataFrame, np.ndarray, np.ndarray]:
     _require_torch()
     model.eval()
@@ -445,7 +534,8 @@ def predict(
     targets_list: list[np.ndarray] = []
     logits_list: list[np.ndarray] = []
     with torch.no_grad():
-        for images, targets, metadata in loader:
+        progress = tqdm(loader, desc=desc, total=len(loader), dynamic_ncols=True, leave=False) if desc else loader
+        for images, targets, metadata in progress:
             images = images.to(device, non_blocking=True)
             targets = targets.to(device, non_blocking=True)
             logits = model(images)
@@ -456,6 +546,8 @@ def predict(
             metadata_rows.extend(metadata_to_rows(metadata, batch_size))
             targets_list.append(targets.detach().cpu().numpy())
             logits_list.append(logits.detach().cpu().numpy())
+            if desc:
+                progress.set_postfix(loss=f"{total_loss / max(total_rows, 1):.4f}")
     y_true = np.concatenate(targets_list, axis=0)
     logits_np = np.concatenate(logits_list, axis=0)
     y_prob = 1.0 / (1.0 + np.exp(-logits_np))
