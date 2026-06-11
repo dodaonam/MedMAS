@@ -9,6 +9,9 @@ from typing import Any
 
 
 MODEL_NAME = "densenet121_cnn_head"
+V2_LOCKED_VARIANT = "v2_locked"
+RARE_SAMPLER_WEAKCROP_VARIANT = "rare_sampler_weakcrop_v1"
+SUPPORTED_RECIPE_VARIANTS = {V2_LOCKED_VARIANT, RARE_SAMPLER_WEAKCROP_VARIANT}
 
 TARGET_LABELS: list[str] = [
     "No Finding",
@@ -32,8 +35,16 @@ def default_training_output_dir(root: Path) -> Path:
     return root / "artifacts" / "training" / MODEL_NAME
 
 
-def create_run_id(seed: int, timestamp: datetime | None = None) -> str:
+def create_run_id(
+    seed: int,
+    timestamp: datetime | None = None,
+    recipe_variant: str = V2_LOCKED_VARIANT,
+) -> str:
+    if recipe_variant not in SUPPORTED_RECIPE_VARIANTS:
+        raise ValueError(f"Unsupported recipe_variant {recipe_variant!r}.")
     stamp = (timestamp or datetime.now()).strftime("%Y%m%d_%H%M%S")
+    if recipe_variant == RARE_SAMPLER_WEAKCROP_VARIANT:
+        return f"{MODEL_NAME}_disease5_320_asl_rare_sampler_weakcrop_seed{seed}_{stamp}"
     return f"{MODEL_NAME}_disease5_320_asl_seed{seed}_{stamp}"
 
 
@@ -118,6 +129,7 @@ def ensure_artifact_tree(paths: TrainingArtifactPaths) -> None:
 class RunConfig:
     run_id: str
     model_name: str = MODEL_NAME
+    recipe_variant: str = V2_LOCKED_VARIANT
     output_dir: str = ""
     seed: int = 0
     split_manifest_path: str = "artifacts/preprocess/split_manifest.csv"
@@ -240,6 +252,13 @@ class RunConfig:
     cnn_head: str = "1024->256->128->128->GAP->Dropout->Linear(5)"
     batchnorm_policy: str = "backbone BN running statistics frozen/eval in both training stages"
     backbone_batchnorm_policy: str = "backbone BN running statistics frozen in both training stages"
+    train_transform_variant: str = "v2_random_resized_crop"
+    sampler_config: dict[str, Any] = field(
+        default_factory=lambda: {
+            "rare_sampler_enabled": False,
+            "reason": "v2_locked uses normal shuffled train batches.",
+        }
+    )
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

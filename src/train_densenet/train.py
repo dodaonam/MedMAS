@@ -11,7 +11,10 @@ import pandas as pd
 
 from .artifacts import (
     DISEASE_LABELS,
+    RARE_SAMPLER_WEAKCROP_VARIANT,
     RunConfig,
+    SUPPORTED_RECIPE_VARIANTS,
+    V2_LOCKED_VARIANT,
     create_run_id,
     default_training_output_dir,
     ensure_artifact_tree,
@@ -36,13 +39,22 @@ from .model import (
     stage2_optimizer_parameters,
 )
 from .progress import ProgressBar
+from .sampling import (
+    create_weighted_random_sampler,
+    disabled_sampler_config,
+    rare_label_sampler_config_and_weights,
+)
 from .schedulers import (
     accumulation_window_example_count,
     build_warmup_cosine_scheduler,
     optimizer_steps_per_epoch,
 )
 from .thresholds import select_validation_thresholds, thresholds_by_label
-from .transforms import build_eval_transform, build_train_transform
+from .transforms import (
+    build_eval_transform,
+    build_train_transform,
+    train_transform_variant_for_recipe,
+)
 
 try:
     import torch
@@ -57,6 +69,7 @@ class TrainingConfig:
     target_labels_path: Path
     output_dir: Path
     seed: int = 0
+    recipe_variant: str = V2_LOCKED_VARIANT
     batch_size: int = 256
     gradient_accumulation_steps: int = 1
     num_workers: int = 0
@@ -158,16 +171,33 @@ def create_criterion(config: TrainingConfig) -> Any:
     )
 
 
+def sampler_config_for_manifest(config: TrainingConfig, labels: list[str]) -> dict[str, Any]:
+    manifest = load_split_manifest(config.manifest_path, labels)
+    assert_patient_disjoint(manifest)
+    if config.recipe_variant == V2_LOCKED_VARIANT:
+        return disabled_sampler_config(config.recipe_variant)
+    if config.recipe_variant == RARE_SAMPLER_WEAKCROP_VARIANT:
+        train_frame = manifest.loc[manifest["split"].astype(str) == "train"].reset_index(drop=True)
+        sampler_config, _weights = rare_label_sampler_config_and_weights(train_frame, labels=labels)
+        return sampler_config
+    raise ValueError(f"Unsupported recipe_variant {config.recipe_variant!r}.")
+
+
 def build_dataloaders(config: TrainingConfig, labels: list[str]) -> dict[str, Any]:
     manifest = load_split_manifest(config.manifest_path, labels)
     assert_patient_disjoint(manifest)
+    train_transform_variant = train_transform_variant_for_recipe(config.recipe_variant)
     datasets = {
         "train": ChestXrayMultiLabelDataset(
             manifest,
             root=config.root,
             split="train",
             target_labels=labels,
-            transform=build_train_transform(input_size=config.input_size, resize_size=config.resize_size),
+            transform=build_train_transform(
+                input_size=config.input_size,
+                resize_size=config.resize_size,
+                variant=train_transform_variant,
+            ),
         ),
         "val": ChestXrayMultiLabelDataset(
             manifest,
@@ -185,13 +215,23 @@ def build_dataloaders(config: TrainingConfig, labels: list[str]) -> dict[str, An
         ),
     }
     pin_memory = bool(torch is not None and torch.cuda.is_available())
+    train_sampler = None
+    if config.recipe_variant == RARE_SAMPLER_WEAKCROP_VARIANT:
+        sampler_config, sample_weights = rare_label_sampler_config_and_weights(datasets["train"].frame, labels=labels)
+        train_sampler = create_weighted_random_sampler(
+            sample_weights,
+            num_samples=sampler_config["rare_sampler_num_samples"],
+            replacement=sampler_config["rare_sampler_replacement"],
+            seed=config.seed,
+        )
     return {
         "train": create_dataloader(
             datasets["train"],
             batch_size=config.batch_size,
-            shuffle=True,
+            shuffle=train_sampler is None,
             num_workers=config.num_workers,
             pin_memory=pin_memory,
+            sampler=train_sampler,
         ),
         "val": create_dataloader(
             datasets["val"],
@@ -342,6 +382,11 @@ def _require_config_float(actual: float, expected: float, name: str) -> None:
 def validate_recipe_config(config: TrainingConfig, labels: list[str]) -> None:
     if labels != DISEASE_LABELS:
         raise ValueError(f"Recipe v2 expects disease labels {DISEASE_LABELS!r}, got {labels!r}")
+    if config.recipe_variant not in SUPPORTED_RECIPE_VARIANTS:
+        raise ValueError(
+            f"Unsupported recipe_variant {config.recipe_variant!r}. "
+            f"Expected one of {sorted(SUPPORTED_RECIPE_VARIANTS)}."
+        )
     _require_config_value(config.target_mode, "disease_only", "target_mode")
     _require_config_value(config.input_size, 320, "input_size")
     _require_config_value(config.resize_size, 352, "resize_size")
@@ -426,10 +471,12 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
     set_seed(config.seed)
     device = resolve_device(config.device)
     amp_enabled = config.use_amp and device.type == "cuda"
-    run_id = create_run_id(config.seed)
+    run_id = create_run_id(config.seed, recipe_variant=config.recipe_variant)
     run_output_dir = resolve_run_output_dir(config.output_dir, run_id)
     paths = resolve_artifact_paths(run_output_dir)
     ensure_artifact_tree(paths)
+    sampler_config = sampler_config_for_manifest(config, labels)
+    train_transform_variant = train_transform_variant_for_recipe(config.recipe_variant)
 
     loss_config = AsymmetricLossConfig(
         gamma_pos=config.asl_gamma_pos,
@@ -440,6 +487,7 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
     ).to_dict()
     run_config = RunConfig(
         run_id=run_id,
+        recipe_variant=config.recipe_variant,
         output_dir=str(paths.output_dir),
         seed=config.seed,
         split_manifest_path=str(config.manifest_path),
@@ -482,6 +530,7 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
         },
         input_size=config.input_size,
         resize_size=config.resize_size,
+        train_transform_variant=train_transform_variant,
         physical_batch_size=config.batch_size,
         gradient_accumulation_steps=config.gradient_accumulation_steps,
         effective_batch_size=config.effective_batch_size,
@@ -500,6 +549,7 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
             "min_lr_factor": config.min_lr_factor,
             "step_unit": "optimizer_step",
         },
+        sampler_config=sampler_config,
         early_stopping_config={
             "patience": config.early_stopping_patience,
             "min_delta": config.min_delta,
@@ -508,6 +558,12 @@ def train_model(config: TrainingConfig) -> dict[str, Any]:
     )
     write_run_config(paths.config_path, run_config)
     save_json(paths.loss_config_path, loss_config)
+    print(
+        f"Run {run_id} | recipe_variant={config.recipe_variant} "
+        f"train_transform_variant={train_transform_variant} "
+        f"rare_sampler_enabled={sampler_config.get('rare_sampler_enabled')}",
+        flush=True,
+    )
 
     dataloaders = build_dataloaders(config, labels)
     model = DenseNet121CNNHead(num_classes=len(labels)).to(device)

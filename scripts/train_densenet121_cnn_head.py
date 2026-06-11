@@ -8,6 +8,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from train_densenet.artifacts import RARE_SAMPLER_WEAKCROP_VARIANT, V2_LOCKED_VARIANT
+
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -17,6 +19,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-labels-path", type=Path, default=ROOT / "artifacts" / "preprocess" / "target_labels.json")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "artifacts" / "training" / "densenet121_cnn_head")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--recipe-variant",
+        default=V2_LOCKED_VARIANT,
+        choices=[V2_LOCKED_VARIANT, RARE_SAMPLER_WEAKCROP_VARIANT],
+    )
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--num-workers", type=int, default=24)
@@ -79,6 +86,7 @@ def main(argv: list[str] | None = None) -> int:
         target_labels_path=args.target_labels_path,
         output_dir=args.output_dir,
         seed=args.seed,
+        recipe_variant=args.recipe_variant,
         batch_size=args.batch_size,
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         num_workers=args.num_workers,

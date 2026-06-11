@@ -142,12 +142,14 @@ def create_dataloader(
     shuffle: bool,
     num_workers: int = 0,
     pin_memory: bool = False,
+    sampler: Any | None = None,
 ) -> Any:
     _require_torch()
     return DataLoader(
         dataset,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=shuffle if sampler is None else False,
+        sampler=sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
     )

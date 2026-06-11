@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from train_densenet.artifacts import (
     MODEL_NAME,
+    RARE_SAMPLER_WEAKCROP_VARIANT,
     TARGET_LABELS,
     RunConfig,
     create_run_id,
@@ -34,6 +35,10 @@ class DenseNetArtifactTests(unittest.TestCase):
         run_id = create_run_id(seed=0)
         self.assertTrue(run_id.startswith(f"{MODEL_NAME}_disease5_320_asl_seed0_"))
 
+    def test_run_id_includes_post_v2_variant_when_selected(self) -> None:
+        run_id = create_run_id(seed=0, recipe_variant=RARE_SAMPLER_WEAKCROP_VARIANT)
+        self.assertTrue(run_id.startswith(f"{MODEL_NAME}_disease5_320_asl_rare_sampler_weakcrop_seed0_"))
+
     def test_artifact_tree_and_target_labels(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp) / "run"
@@ -50,6 +55,7 @@ class DenseNetArtifactTests(unittest.TestCase):
             config = RunConfig(run_id="unit", output_dir=str(run_dir))
             write_run_config(paths.config_path, config)
             loaded = json.loads(paths.config_path.read_text(encoding="utf-8"))
+            self.assertEqual(loaded["recipe_variant"], "v2_locked")
             self.assertEqual(loaded["stage2_name"], "denseblock4_norm5_finetune")
             self.assertEqual(loaded["target_mode"], "disease_only")
             self.assertEqual(loaded["target_labels"], labels_for_target_mode("disease_only"))
@@ -60,6 +66,7 @@ class DenseNetArtifactTests(unittest.TestCase):
             self.assertIn("cnn_head_config", loaded)
             self.assertIn("batchnorm_policy", loaded)
             self.assertIn("amp_enabled", loaded)
+            self.assertIn("sampler_config", loaded)
 
     def test_target_mode_is_disease_only(self) -> None:
         self.assertEqual(labels_for_target_mode("disease_only"), TARGET_LABELS[1:])
