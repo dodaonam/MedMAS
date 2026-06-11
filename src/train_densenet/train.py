@@ -1,118 +1,617 @@
 from __future__ import annotations
 
+import json
 import random
+import re
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
-
-from .artifacts import (
-    DISEASE_LABELS,
-    RARE_SAMPLER_WEAKCROP_VARIANT,
-    RunConfig,
-    SUPPORTED_RECIPE_VARIANTS,
-    V2_LOCKED_VARIANT,
-    create_run_id,
-    default_training_output_dir,
-    ensure_artifact_tree,
-    labels_for_target_mode,
-    load_target_labels,
-    label_slug,
-    resolve_artifact_paths,
-    resolve_run_output_dir,
-    save_json,
-    write_run_config,
-)
-from .dataset import ChestXrayMultiLabelDataset, assert_patient_disjoint, create_dataloader, load_split_manifest
-from .evaluate import evaluate_prediction_frame, run_inference
-from .losses import AsymmetricLossConfig, build_asymmetric_loss
-from .metrics import checkpoint_candidate_improved, compute_multilabel_metrics
-from .model import (
-    DenseNet121CNNHead,
-    configure_stage1,
-    configure_stage2,
-    set_backbone_batchnorm_eval,
-    stage1_optimizer_parameters,
-    stage2_optimizer_parameters,
-)
-from .progress import ProgressBar
-from .sampling import (
-    create_weighted_random_sampler,
-    disabled_sampler_config,
-    rare_label_sampler_config_and_weights,
-)
-from .schedulers import (
-    accumulation_window_example_count,
-    build_warmup_cosine_scheduler,
-    optimizer_steps_per_epoch,
-)
-from .thresholds import select_validation_thresholds, thresholds_by_label
-from .transforms import (
-    build_eval_transform,
-    build_train_transform,
-    train_transform_variant_for_recipe,
-)
+from PIL import Image
 
 try:
     import torch
-except ModuleNotFoundError:  # pragma: no cover - exercised only on machines without torch
+    from torch.utils.data import DataLoader, Dataset
+except ModuleNotFoundError:  # pragma: no cover - only happens before torch is installed
     torch = None  # type: ignore[assignment]
+    DataLoader = None  # type: ignore[assignment]
+    Dataset = object  # type: ignore[assignment,misc]
+
+
+MODEL_NAME = "densenet121"
+TARGET_LABELS = ["No Finding", "Infiltration", "Effusion", "Atelectasis", "Nodule", "Mass"]
+METADATA_COLUMNS = [
+    "Image Index",
+    "Patient ID",
+    "split",
+    "image_path",
+    "Patient Gender",
+    "View Position",
+    "AgeBin",
+    "has_out_of_scope_label",
+]
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
 @dataclass
-class TrainingConfig:
+class TrainConfig:
     root: Path
     manifest_path: Path
     target_labels_path: Path
     output_dir: Path
     seed: int = 0
-    recipe_variant: str = V2_LOCKED_VARIANT
-    batch_size: int = 256
-    gradient_accumulation_steps: int = 1
-    num_workers: int = 0
-    input_size: int = 320
-    resize_size: int = 352
-    target_mode: str = "disease_only"
-    stage1_epochs: int = 5
-    stage2_epochs: int = 30
-    stage2_min_epochs_before_early_stop: int = 5
-    early_stopping_patience: int = 5
-    min_delta: float = 0.001
-    head_lr_stage1: float = 3e-4
-    head_lr_stage2: float = 1e-4
-    backbone_lr_stage2: float = 1e-5
+    epochs: int = 10
+    batch_size: int = 32
+    num_workers: int = 4
+    image_size: int = 224
+    lr: float = 1e-4
     weight_decay: float = 1e-4
-    scheduler: str = "warmup_cosine"
-    warmup_ratio: float = 0.10
-    min_lr_factor: float = 0.01
-    loss: str = "asymmetric"
-    asl_gamma_pos: float = 0.0
-    asl_gamma_neg: float = 4.0
-    asl_clip: float = 0.05
-    asl_eps: float = 1e-8
-    use_amp: bool = True
+    threshold: float = 0.5
+    pretrained: bool = True
     device: str | None = None
 
-    @property
-    def effective_batch_size(self) -> int:
-        return int(self.batch_size * self.gradient_accumulation_steps)
+
+@dataclass(frozen=True)
+class ArtifactPaths:
+    run_dir: Path
+    config_path: Path
+    history_path: Path
+    checkpoint_path: Path
+    predictions_val_path: Path
+    predictions_test_path: Path
+    metrics_val_path: Path
+    metrics_test_path: Path
+    figures_dir: Path
 
 
-def default_training_config(root: Path, output_dir: Path | None = None) -> TrainingConfig:
-    return TrainingConfig(
+def default_train_config(root: Path, output_dir: Path | None = None) -> TrainConfig:
+    return TrainConfig(
         root=root,
         manifest_path=root / "artifacts" / "preprocess" / "split_manifest.csv",
         target_labels_path=root / "artifacts" / "preprocess" / "target_labels.json",
-        output_dir=output_dir or default_training_output_dir(root),
+        output_dir=output_dir or root / "artifacts" / "training" / MODEL_NAME,
     )
 
 
-def _require_torch() -> None:
-    if torch is None:
-        raise ModuleNotFoundError("PyTorch is required to train DenseNet121. Install torch and torchvision first.")
+def label_slug(label: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", label.lower().strip())
+    return slug.strip("_")
+
+
+def save_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=True, default=_json_default), encoding="utf-8")
+
+
+def load_target_labels(path: Path) -> list[str]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    labels = payload.get("target_labels", payload) if isinstance(payload, dict) else payload
+    if labels != TARGET_LABELS:
+        raise ValueError(f"Unexpected target labels in {path}: {labels!r}")
+    return list(labels)
+
+
+def create_run_id(seed: int, timestamp: datetime | None = None) -> str:
+    stamp = (timestamp or datetime.now()).strftime("%Y%m%d_%H%M%S")
+    return f"{MODEL_NAME}_seed{seed}_{stamp}"
+
+
+def artifact_paths(run_dir: Path) -> ArtifactPaths:
+    return ArtifactPaths(
+        run_dir=run_dir,
+        config_path=run_dir / "config.json",
+        history_path=run_dir / "training_history.csv",
+        checkpoint_path=run_dir / "checkpoint_best.pt",
+        predictions_val_path=run_dir / "predictions_val.csv",
+        predictions_test_path=run_dir / "predictions_test.csv",
+        metrics_val_path=run_dir / "metrics_val.json",
+        metrics_test_path=run_dir / "metrics_test.json",
+        figures_dir=run_dir / "figures",
+    )
+
+
+def resolve_run_dir(path: Path) -> Path:
+    if (path / "config.json").is_file():
+        return path
+    if path.is_dir():
+        candidates = [child for child in path.iterdir() if (child / "config.json").is_file()]
+        if candidates:
+            return max(candidates, key=lambda child: child.stat().st_mtime)
+    return path
+
+
+def load_manifest(path: Path, labels: list[str]) -> pd.DataFrame:
+    frame = pd.read_csv(
+        path,
+        dtype={
+            "Image Index": "string",
+            "Patient ID": "string",
+            "Patient Gender": "string",
+            "View Position": "string",
+            "AgeBin": "string",
+            "split": "string",
+            "image_path": "string",
+        },
+    )
+    required = [*METADATA_COLUMNS, *labels]
+    missing = [column for column in required if column not in frame.columns]
+    if missing:
+        raise ValueError(f"Manifest is missing required columns: {missing}")
+    split_values = set(frame["split"].dropna().astype(str))
+    if split_values != {"train", "val", "test"}:
+        raise ValueError(f"Expected train/val/test splits, got {sorted(split_values)}")
+    for label in labels:
+        values = set(frame[label].dropna().astype(int).unique().tolist())
+        if not values.issubset({0, 1}):
+            raise ValueError(f"Label column {label!r} is not binary: {values}")
+        frame[label] = frame[label].astype(int)
+    assert_patient_disjoint(frame)
+    return frame
+
+
+def assert_patient_disjoint(frame: pd.DataFrame) -> None:
+    patient_sets = {
+        split: set(frame.loc[frame["split"].astype(str) == split, "Patient ID"].astype(str))
+        for split in ["train", "val", "test"]
+    }
+    overlaps = {}
+    for left, right in [("train", "val"), ("train", "test"), ("val", "test")]:
+        overlap = patient_sets[left] & patient_sets[right]
+        if overlap:
+            overlaps[f"{left}_{right}"] = sorted(overlap)[:10]
+    if overlaps:
+        raise ValueError(f"Patient IDs overlap across splits: {overlaps}")
+
+
+class ChestXrayDataset(Dataset):  # type: ignore[misc]
+    def __init__(self, frame: pd.DataFrame, *, root: Path, split: str, labels: list[str], transform: Any) -> None:
+        _require_torch()
+        self.frame = frame.loc[frame["split"].astype(str) == split].reset_index(drop=True)
+        if self.frame.empty:
+            raise ValueError(f"No rows found for split {split!r}")
+        self.root = root
+        self.labels = labels
+        self.transform = transform
+
+    def __len__(self) -> int:
+        return int(len(self.frame))
+
+    def __getitem__(self, index: int) -> tuple[Any, Any, dict[str, Any]]:
+        row = self.frame.iloc[index]
+        image_path = Path(str(row["image_path"]))
+        if not image_path.is_absolute():
+            image_path = self.root / image_path
+        with Image.open(image_path) as image:
+            image_tensor = self.transform(image.convert("RGB"))
+        target = torch.tensor(row[self.labels].to_numpy(dtype=np.float32), dtype=torch.float32)
+        metadata = {column: row[column] for column in METADATA_COLUMNS if column in row.index}
+        return image_tensor, target, metadata
+
+
+def build_transforms(image_size: int) -> tuple[Any, Any]:
+    from torchvision import transforms
+
+    resize_size = image_size + 32
+    train_transform = transforms.Compose(
+        [
+            transforms.Resize(resize_size),
+            transforms.RandomResizedCrop(image_size, scale=(0.9, 1.0), ratio=(0.95, 1.05)),
+            transforms.RandomRotation(5),
+            transforms.ToTensor(),
+            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ]
+    )
+    eval_transform = transforms.Compose(
+        [
+            transforms.Resize(resize_size),
+            transforms.CenterCrop(image_size),
+            transforms.ToTensor(),
+            transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+        ]
+    )
+    return train_transform, eval_transform
+
+
+def denormalize_image_tensor(image_tensor: Any) -> Any:
+    _require_torch()
+    mean = torch.tensor(IMAGENET_MEAN, dtype=image_tensor.dtype, device=image_tensor.device).view(3, 1, 1)
+    std = torch.tensor(IMAGENET_STD, dtype=image_tensor.dtype, device=image_tensor.device).view(3, 1, 1)
+    return (image_tensor * std + mean).clamp(0, 1)
+
+
+def build_model(num_labels: int, *, pretrained: bool = True) -> Any:
+    _require_torch()
+    from torchvision.models import DenseNet121_Weights, densenet121
+
+    weights = DenseNet121_Weights.DEFAULT if pretrained else None
+    model = densenet121(weights=weights)
+    model.classifier = torch.nn.Linear(model.classifier.in_features, num_labels)
+    return model
+
+
+def train_model(config: TrainConfig) -> dict[str, Any]:
+    _require_torch()
+    labels = load_target_labels(config.target_labels_path)
+    frame = load_manifest(config.manifest_path, labels)
+    set_seed(config.seed)
+    device = resolve_device(config.device)
+
+    run_id = create_run_id(config.seed)
+    paths = artifact_paths(config.output_dir / run_id)
+    paths.run_dir.mkdir(parents=True, exist_ok=False)
+
+    train_loader, val_loader, test_loader = build_dataloaders(config, frame, labels)
+    model = build_model(len(labels), pretrained=config.pretrained).to(device)
+    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=positive_weights(frame, labels).to(device))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+
+    config_payload = {
+        **_config_to_json(config),
+        "run_id": run_id,
+        "model_name": MODEL_NAME,
+        "target_labels": labels,
+        "threshold": config.threshold,
+        "best_checkpoint": str(paths.checkpoint_path),
+        "torch_version": getattr(torch, "__version__", None),
+        "device": str(device),
+    }
+    save_json(paths.config_path, config_payload)
+
+    history: list[dict[str, Any]] = []
+    best_score = -float("inf")
+    best_epoch = 0
+    for epoch in range(1, config.epochs + 1):
+        start = time.time()
+        train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device)
+        val_loss, val_frame, y_true, y_prob = predict(
+            model,
+            val_loader,
+            criterion,
+            device,
+            labels,
+            threshold=config.threshold,
+            run_id=run_id,
+        )
+        val_metrics = compute_metrics(y_true, y_prob, labels, threshold=config.threshold, run_id=run_id)
+        score = _score_for_checkpoint(val_metrics, val_loss)
+        if score > best_score:
+            best_score = score
+            best_epoch = epoch
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "labels": labels,
+                    "config": config_payload,
+                    "epoch": epoch,
+                    "val_metrics": val_metrics,
+                },
+                paths.checkpoint_path,
+            )
+            val_frame.to_csv(paths.predictions_val_path, index=False)
+            save_json(paths.metrics_val_path, val_metrics)
+
+        row = {
+            "run_id": run_id,
+            "epoch": epoch,
+            "train_loss": train_loss,
+            "val_loss": val_loss,
+            "val_macro_average_precision": val_metrics["macro_average_precision"],
+            "val_macro_auroc": val_metrics["macro_auroc"],
+            "val_macro_f1": val_metrics["macro_f1"],
+            "learning_rate": optimizer.param_groups[0]["lr"],
+            "epoch_seconds": round(time.time() - start, 3),
+        }
+        history.append(row)
+        pd.DataFrame(history).to_csv(paths.history_path, index=False)
+        print(
+            f"epoch {epoch:03d}/{config.epochs} "
+            f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
+            f"val_macro_ap={_fmt_metric(row['val_macro_average_precision'])}"
+        )
+
+    checkpoint = torch.load(paths.checkpoint_path, map_location=device)
+    model.load_state_dict(checkpoint["model_state_dict"])
+    val_loss, val_frame, val_true, val_prob = predict(
+        model,
+        val_loader,
+        criterion,
+        device,
+        labels,
+        threshold=config.threshold,
+        run_id=run_id,
+    )
+    test_loss, test_frame, test_true, test_prob = predict(
+        model,
+        test_loader,
+        criterion,
+        device,
+        labels,
+        threshold=config.threshold,
+        run_id=run_id,
+    )
+    val_metrics = compute_metrics(val_true, val_prob, labels, threshold=config.threshold, run_id=run_id)
+    test_metrics = compute_metrics(test_true, test_prob, labels, threshold=config.threshold, run_id=run_id)
+    val_metrics["loss"] = val_loss
+    test_metrics["loss"] = test_loss
+
+    val_frame.to_csv(paths.predictions_val_path, index=False)
+    test_frame.to_csv(paths.predictions_test_path, index=False)
+    save_json(paths.metrics_val_path, val_metrics)
+    save_json(paths.metrics_test_path, test_metrics)
+
+    return {
+        "run_id": run_id,
+        "run_dir": str(paths.run_dir),
+        "best_epoch": best_epoch,
+        "best_val_score": best_score,
+        "test_loss": test_loss,
+        "test_macro_average_precision": test_metrics["macro_average_precision"],
+        "test_macro_auroc": test_metrics["macro_auroc"],
+        "test_macro_f1": test_metrics["macro_f1"],
+    }
+
+
+def smoke_check(config: TrainConfig) -> dict[str, Any]:
+    _require_torch()
+    labels = load_target_labels(config.target_labels_path)
+    frame = load_manifest(config.manifest_path, labels)
+    train_loader, _, _ = build_dataloaders(config, frame, labels)
+    device = resolve_device(config.device)
+    model = build_model(len(labels), pretrained=config.pretrained).to(device)
+    images, targets, _metadata = next(iter(train_loader))
+    model.eval()
+    with torch.no_grad():
+        logits = model(images.to(device))
+    return {
+        "batch_shape": list(images.shape),
+        "target_shape": list(targets.shape),
+        "logit_shape": list(logits.shape),
+        "device": str(device),
+    }
+
+
+def build_dataloaders(config: TrainConfig, frame: pd.DataFrame, labels: list[str]) -> tuple[Any, Any, Any]:
+    _require_torch()
+    train_transform, eval_transform = build_transforms(config.image_size)
+    datasets = {
+        "train": ChestXrayDataset(frame, root=config.root, split="train", labels=labels, transform=train_transform),
+        "val": ChestXrayDataset(frame, root=config.root, split="val", labels=labels, transform=eval_transform),
+        "test": ChestXrayDataset(frame, root=config.root, split="test", labels=labels, transform=eval_transform),
+    }
+    pin_memory = bool(torch.cuda.is_available())
+    return (
+        DataLoader(
+            datasets["train"],
+            batch_size=config.batch_size,
+            shuffle=True,
+            num_workers=config.num_workers,
+            pin_memory=pin_memory,
+        ),
+        DataLoader(
+            datasets["val"],
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=config.num_workers,
+            pin_memory=pin_memory,
+        ),
+        DataLoader(
+            datasets["test"],
+            batch_size=config.batch_size,
+            shuffle=False,
+            num_workers=config.num_workers,
+            pin_memory=pin_memory,
+        ),
+    )
+
+
+def train_one_epoch(model: Any, loader: Any, criterion: Any, optimizer: Any, device: Any) -> float:
+    model.train()
+    total_loss = 0.0
+    total_rows = 0
+    for images, targets, _metadata in loader:
+        images = images.to(device, non_blocking=True)
+        targets = targets.to(device, non_blocking=True)
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(images)
+        loss = criterion(logits, targets)
+        loss.backward()
+        optimizer.step()
+        batch_size = int(images.shape[0])
+        total_loss += float(loss.detach().cpu()) * batch_size
+        total_rows += batch_size
+    return total_loss / max(total_rows, 1)
+
+
+def predict(
+    model: Any,
+    loader: Any,
+    criterion: Any,
+    device: Any,
+    labels: list[str],
+    *,
+    threshold: float,
+    run_id: str,
+) -> tuple[float, pd.DataFrame, np.ndarray, np.ndarray]:
+    _require_torch()
+    model.eval()
+    total_loss = 0.0
+    total_rows = 0
+    metadata_rows: list[dict[str, Any]] = []
+    targets_list: list[np.ndarray] = []
+    logits_list: list[np.ndarray] = []
+    with torch.no_grad():
+        for images, targets, metadata in loader:
+            images = images.to(device, non_blocking=True)
+            targets = targets.to(device, non_blocking=True)
+            logits = model(images)
+            loss = criterion(logits, targets)
+            batch_size = int(images.shape[0])
+            total_loss += float(loss.detach().cpu()) * batch_size
+            total_rows += batch_size
+            metadata_rows.extend(metadata_to_rows(metadata, batch_size))
+            targets_list.append(targets.detach().cpu().numpy())
+            logits_list.append(logits.detach().cpu().numpy())
+    y_true = np.concatenate(targets_list, axis=0)
+    logits_np = np.concatenate(logits_list, axis=0)
+    y_prob = 1.0 / (1.0 + np.exp(-logits_np))
+    frame = prediction_frame(metadata_rows, y_true, y_prob, labels, threshold=threshold, run_id=run_id)
+    return total_loss / max(total_rows, 1), frame, y_true, y_prob
+
+
+def prediction_frame(
+    metadata_rows: list[dict[str, Any]],
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    labels: list[str],
+    *,
+    threshold: float,
+    run_id: str,
+) -> pd.DataFrame:
+    rows: list[dict[str, Any]] = []
+    for idx, metadata in enumerate(metadata_rows):
+        row = dict(metadata)
+        row["run_id"] = run_id
+        for label_idx, label in enumerate(labels):
+            slug = label_slug(label)
+            probability = float(y_prob[idx, label_idx])
+            row[label] = int(y_true[idx, label_idx])
+            row[f"true_{slug}"] = int(y_true[idx, label_idx])
+            row[f"prob_{slug}"] = probability
+            row[f"threshold_{slug}"] = float(threshold)
+            row[f"pred_{slug}"] = int(probability >= threshold)
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def metadata_to_rows(metadata: Any, batch_size: int) -> list[dict[str, Any]]:
+    if not isinstance(metadata, dict):
+        return list(metadata)
+    rows: list[dict[str, Any]] = []
+    for index in range(batch_size):
+        row: dict[str, Any] = {}
+        for key, value in metadata.items():
+            if isinstance(value, (list, tuple)):
+                row[key] = value[index]
+            elif torch is not None and torch.is_tensor(value):
+                item = value[index]
+                row[key] = item.item() if item.ndim == 0 else item.detach().cpu().tolist()
+            else:
+                row[key] = value
+        rows.append(row)
+    return rows
+
+
+def positive_weights(frame: pd.DataFrame, labels: list[str]) -> Any:
+    _require_torch()
+    train = frame.loc[frame["split"].astype(str) == "train", labels].to_numpy(dtype=np.float32)
+    positives = train.sum(axis=0)
+    negatives = train.shape[0] - positives
+    weights = negatives / np.maximum(positives, 1.0)
+    return torch.tensor(weights, dtype=torch.float32)
+
+
+def compute_metrics(
+    y_true: Any,
+    y_prob: Any,
+    labels: list[str],
+    *,
+    threshold: float = 0.5,
+    run_id: str | None = None,
+) -> dict[str, Any]:
+    true = np.asarray(y_true, dtype=int)
+    prob = np.asarray(y_prob, dtype=float)
+    if true.shape != prob.shape:
+        raise ValueError(f"Shape mismatch: y_true {true.shape}, y_prob {prob.shape}")
+    if true.ndim != 2 or true.shape[1] != len(labels):
+        raise ValueError(f"Expected shape [n, {len(labels)}], got {true.shape}")
+
+    per_label: dict[str, Any] = {}
+    micro_counts = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
+    for index, label in enumerate(labels):
+        pred = (prob[:, index] >= threshold).astype(int)
+        counts = confusion_counts(true[:, index], pred)
+        for key in micro_counts:
+            micro_counts[key] += counts[key]
+        basic = metrics_from_counts(counts)
+        per_label[label] = {
+            **counts,
+            **basic,
+            "positive_count": int(np.sum(true[:, index] == 1)),
+            "threshold": float(threshold),
+            "average_precision": average_precision(true[:, index], prob[:, index]),
+            "auroc": auroc(true[:, index], prob[:, index]),
+        }
+
+    return {
+        "run_id": run_id,
+        "labels": labels,
+        "threshold": float(threshold),
+        "per_label": per_label,
+        "macro_precision": mean_defined(item["precision"] for item in per_label.values()),
+        "macro_recall": mean_defined(item["recall"] for item in per_label.values()),
+        "macro_f1": mean_defined(item["f1"] for item in per_label.values()),
+        "macro_average_precision": mean_defined(item["average_precision"] for item in per_label.values()),
+        "macro_auroc": mean_defined(item["auroc"] for item in per_label.values()),
+        "micro": {**micro_counts, **metrics_from_counts(micro_counts)},
+    }
+
+
+def confusion_counts(y_true: Any, y_pred: Any) -> dict[str, int]:
+    true = np.asarray(y_true, dtype=int)
+    pred = np.asarray(y_pred, dtype=int)
+    return {
+        "tp": int(np.sum((true == 1) & (pred == 1))),
+        "fp": int(np.sum((true == 0) & (pred == 1))),
+        "fn": int(np.sum((true == 1) & (pred == 0))),
+        "tn": int(np.sum((true == 0) & (pred == 0))),
+    }
+
+
+def metrics_from_counts(counts: dict[str, int]) -> dict[str, float]:
+    tp = counts["tp"]
+    fp = counts["fp"]
+    fn = counts["fn"]
+    precision = tp / (tp + fp) if tp + fp else 0.0
+    recall = tp / (tp + fn) if tp + fn else 0.0
+    f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+    return {"precision": precision, "recall": recall, "f1": f1}
+
+
+def average_precision(y_true: Any, y_score: Any) -> float | None:
+    true = np.asarray(y_true, dtype=int)
+    score = np.asarray(y_score, dtype=float)
+    positives = int(np.sum(true == 1))
+    if positives == 0 or positives == len(true):
+        return None
+    order = np.argsort(-score, kind="mergesort")
+    sorted_true = true[order]
+    precision_at_k = np.cumsum(sorted_true == 1) / np.arange(1, len(sorted_true) + 1)
+    return float(np.sum(precision_at_k * (sorted_true == 1)) / positives)
+
+
+def auroc(y_true: Any, y_score: Any) -> float | None:
+    true = np.asarray(y_true, dtype=int)
+    score = np.asarray(y_score, dtype=float)
+    positives = score[true == 1]
+    negatives = score[true == 0]
+    if len(positives) == 0 or len(negatives) == 0:
+        return None
+    comparisons = positives[:, None] - negatives[None, :]
+    wins = np.sum(comparisons > 0)
+    ties = np.sum(comparisons == 0)
+    return float((wins + 0.5 * ties) / (len(positives) * len(negatives)))
+
+
+def mean_defined(values: Any) -> float | None:
+    defined = [float(value) for value in values if value is not None]
+    if not defined:
+        return None
+    return float(np.mean(defined))
 
 
 def set_seed(seed: int) -> None:
@@ -126,681 +625,42 @@ def set_seed(seed: int) -> None:
 
 def resolve_device(device: str | None = None) -> Any:
     _require_torch()
-    if device is not None:
+    if device:
         return torch.device(device)
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def runtime_environment_config(device: Any, *, amp_enabled: bool) -> dict[str, Any]:
-    _require_torch()
-    try:
-        import torchvision
-    except ModuleNotFoundError:
-        torchvision_version = None
-    else:
-        torchvision_version = getattr(torchvision, "__version__", None)
-
-    device_name = str(device)
-    if getattr(device, "type", None) == "cuda" and torch.cuda.is_available():
-        try:
-            device_name = torch.cuda.get_device_name(device)
-        except Exception:
-            device_name = str(device)
-
-    return {
-        "amp_enabled": bool(amp_enabled),
-        "torch_version": getattr(torch, "__version__", None),
-        "torchvision_version": torchvision_version,
-        "cuda_version": getattr(torch.version, "cuda", None),
-        "device_name": device_name,
-    }
+def _score_for_checkpoint(metrics: dict[str, Any], val_loss: float) -> float:
+    macro_ap = metrics.get("macro_average_precision")
+    if macro_ap is not None:
+        return float(macro_ap)
+    return -float(val_loss)
 
 
-def create_criterion(config: TrainingConfig) -> Any:
-    _require_torch()
-    if config.loss != "asymmetric":
-        raise ValueError("Recipe v2 supports only Asymmetric Loss via --loss asymmetric.")
-    return build_asymmetric_loss(
-        AsymmetricLossConfig(
-            gamma_pos=config.asl_gamma_pos,
-            gamma_neg=config.asl_gamma_neg,
-            clip=config.asl_clip,
-            eps=config.asl_eps,
-            reduction="mean",
-        )
-    )
+def _config_to_json(config: TrainConfig) -> dict[str, Any]:
+    payload = asdict(config)
+    for key, value in payload.items():
+        if isinstance(value, Path):
+            payload[key] = str(value)
+    return payload
 
 
-def sampler_config_for_manifest(config: TrainingConfig, labels: list[str]) -> dict[str, Any]:
-    manifest = load_split_manifest(config.manifest_path, labels)
-    assert_patient_disjoint(manifest)
-    if config.recipe_variant == V2_LOCKED_VARIANT:
-        return disabled_sampler_config(config.recipe_variant)
-    if config.recipe_variant == RARE_SAMPLER_WEAKCROP_VARIANT:
-        train_frame = manifest.loc[manifest["split"].astype(str) == "train"].reset_index(drop=True)
-        sampler_config, _weights = rare_label_sampler_config_and_weights(train_frame, labels=labels)
-        return sampler_config
-    raise ValueError(f"Unsupported recipe_variant {config.recipe_variant!r}.")
+def _json_default(value: Any) -> Any:
+    if isinstance(value, Path):
+        return str(value)
+    if isinstance(value, np.integer):
+        return int(value)
+    if isinstance(value, np.floating):
+        return float(value)
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
 
 
-def build_dataloaders(config: TrainingConfig, labels: list[str]) -> dict[str, Any]:
-    manifest = load_split_manifest(config.manifest_path, labels)
-    assert_patient_disjoint(manifest)
-    train_transform_variant = train_transform_variant_for_recipe(config.recipe_variant)
-    datasets = {
-        "train": ChestXrayMultiLabelDataset(
-            manifest,
-            root=config.root,
-            split="train",
-            target_labels=labels,
-            transform=build_train_transform(
-                input_size=config.input_size,
-                resize_size=config.resize_size,
-                variant=train_transform_variant,
-            ),
-        ),
-        "val": ChestXrayMultiLabelDataset(
-            manifest,
-            root=config.root,
-            split="val",
-            target_labels=labels,
-            transform=build_eval_transform(input_size=config.input_size, resize_size=config.resize_size),
-        ),
-        "test": ChestXrayMultiLabelDataset(
-            manifest,
-            root=config.root,
-            split="test",
-            target_labels=labels,
-            transform=build_eval_transform(input_size=config.input_size, resize_size=config.resize_size),
-        ),
-    }
-    pin_memory = bool(torch is not None and torch.cuda.is_available())
-    train_sampler = None
-    if config.recipe_variant == RARE_SAMPLER_WEAKCROP_VARIANT:
-        sampler_config, sample_weights = rare_label_sampler_config_and_weights(datasets["train"].frame, labels=labels)
-        train_sampler = create_weighted_random_sampler(
-            sample_weights,
-            num_samples=sampler_config["rare_sampler_num_samples"],
-            replacement=sampler_config["rare_sampler_replacement"],
-            seed=config.seed,
-        )
-    return {
-        "train": create_dataloader(
-            datasets["train"],
-            batch_size=config.batch_size,
-            shuffle=train_sampler is None,
-            num_workers=config.num_workers,
-            pin_memory=pin_memory,
-            sampler=train_sampler,
-        ),
-        "val": create_dataloader(
-            datasets["val"],
-            batch_size=config.batch_size,
-            shuffle=False,
-            num_workers=config.num_workers,
-            pin_memory=pin_memory,
-        ),
-        "test": create_dataloader(
-            datasets["test"],
-            batch_size=config.batch_size,
-            shuffle=False,
-            num_workers=config.num_workers,
-            pin_memory=pin_memory,
-        ),
-    }
+def _fmt_metric(value: Any) -> str:
+    return "NA" if value is None else f"{float(value):.4f}"
 
 
-def run_stage0_smoke(
-    model: Any,
-    dataloader: Any,
-    criterion: Any,
-    device: Any,
-    labels: list[str],
-    *,
-    input_size: int = 320,
-) -> None:
-    _require_torch()
-    model.train()
-    set_backbone_batchnorm_eval(model)
-    images, targets, _metadata = next(iter(dataloader))
-    images = images.to(device)
-    targets = targets.to(device)
-    assert images.ndim == 4
-    assert tuple(images.shape[1:]) == (3, input_size, input_size)
-    assert images.dtype == torch.float32
-    assert targets.ndim == 2
-    assert targets.shape[1] == len(labels)
-    assert targets.dtype == torch.float32
-    logits = model(images)
-    assert logits.shape == targets.shape
-    assert logits.dtype == torch.float32
-    loss = criterion(logits, targets)
-    loss.backward()
-    model.zero_grad(set_to_none=True)
-
-
-def train_one_epoch(
-    *,
-    model: Any,
-    dataloader: Any,
-    criterion: Any,
-    optimizer: Any,
-    scheduler: Any,
-    device: Any,
-    use_amp: bool,
-    gradient_accumulation_steps: int,
-    progress_desc: str,
-) -> float:
-    _require_torch()
-    model.train()
-    set_backbone_batchnorm_eval(model)
-    total_loss = 0.0
-    total_rows = 0
-    amp_enabled = use_amp and device.type == "cuda"
-    amp_device_type = "cuda" if device.type == "cuda" else "cpu"
-    scaler = torch.amp.GradScaler(amp_device_type, enabled=amp_enabled)
-    configured_batch_size = int(getattr(dataloader, "batch_size", 0) or 0)
-    total_examples = int(len(dataloader.dataset)) if hasattr(dataloader, "dataset") else 0
-    optimizer.zero_grad(set_to_none=True)
-    with ProgressBar(total=len(dataloader), desc=progress_desc) as progress:
-        for batch_idx, (images, targets, _metadata) in enumerate(dataloader, start=1):
-            images = images.to(device)
-            targets = targets.to(device)
-            batch_size = int(images.shape[0])
-            effective_batch_size = configured_batch_size or batch_size
-            effective_total_examples = total_examples or len(dataloader) * effective_batch_size
-            with torch.amp.autocast(amp_device_type, enabled=amp_enabled):
-                logits = model(images)
-                loss = criterion(logits, targets)
-                window_examples = accumulation_window_example_count(
-                    batch_index=batch_idx,
-                    total_batches=len(dataloader),
-                    total_examples=effective_total_examples,
-                    batch_size=effective_batch_size,
-                    gradient_accumulation_steps=gradient_accumulation_steps,
-                )
-                scaled_loss = loss * (batch_size / window_examples)
-            scaler.scale(scaled_loss).backward()
-            should_step = batch_idx % gradient_accumulation_steps == 0 or batch_idx == len(dataloader)
-            if should_step:
-                scaler.step(optimizer)
-                scaler.update()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-            total_loss += float(loss.detach().cpu()) * batch_size
-            total_rows += batch_size
-            progress.update(loss=total_loss / max(total_rows, 1))
-    return total_loss / max(total_rows, 1)
-
-
-def evaluate_loss(
-    *,
-    model: Any,
-    dataloader: Any,
-    criterion: Any,
-    device: Any,
-    labels: list[str],
-    progress_desc: str,
-) -> tuple[float, dict[str, Any]]:
-    _require_torch()
-    model.eval()
-    total_loss = 0.0
-    total_rows = 0
-    true_batches: list[np.ndarray] = []
-    prob_batches: list[np.ndarray] = []
-    with torch.no_grad():
-        with ProgressBar(total=len(dataloader), desc=progress_desc) as progress:
-            for images, targets, _metadata in dataloader:
-                images = images.to(device)
-                targets = targets.to(device)
-                logits = model(images)
-                loss = criterion(logits, targets)
-                probabilities = torch.sigmoid(logits)
-                batch_size = int(images.shape[0])
-                total_loss += float(loss.detach().cpu()) * batch_size
-                total_rows += batch_size
-                true_batches.append(targets.detach().cpu().numpy())
-                prob_batches.append(probabilities.detach().cpu().numpy())
-                progress.update(loss=total_loss / max(total_rows, 1))
-    y_true = np.concatenate(true_batches, axis=0)
-    y_prob = np.concatenate(prob_batches, axis=0)
-    default_thresholds = {label: 0.5 for label in labels}
-    metrics = compute_multilabel_metrics(y_true, y_prob, default_thresholds, labels)
-    return total_loss / max(total_rows, 1), metrics
-
-
-def _require_config_value(actual: Any, expected: Any, name: str) -> None:
-    if actual != expected:
-        raise ValueError(f"Recipe v2 requires {name}={expected!r}, got {actual!r}.")
-
-
-def _require_config_float(actual: float, expected: float, name: str) -> None:
-    if not np.isclose(float(actual), float(expected), rtol=1e-12, atol=0.0):
-        raise ValueError(f"Recipe v2 requires {name}={expected!r}, got {actual!r}.")
-
-
-def validate_recipe_config(config: TrainingConfig, labels: list[str]) -> None:
-    if labels != DISEASE_LABELS:
-        raise ValueError(f"Recipe v2 expects disease labels {DISEASE_LABELS!r}, got {labels!r}")
-    if config.recipe_variant not in SUPPORTED_RECIPE_VARIANTS:
-        raise ValueError(
-            f"Unsupported recipe_variant {config.recipe_variant!r}. "
-            f"Expected one of {sorted(SUPPORTED_RECIPE_VARIANTS)}."
-        )
-    _require_config_value(config.target_mode, "disease_only", "target_mode")
-    _require_config_value(config.input_size, 320, "input_size")
-    _require_config_value(config.resize_size, 352, "resize_size")
-    _require_config_value(config.stage1_epochs, 5, "stage1_epochs")
-    _require_config_value(config.stage2_epochs, 30, "stage2_epochs")
-    _require_config_value(config.stage2_min_epochs_before_early_stop, 5, "stage2_min_epochs_before_early_stop")
-    _require_config_value(config.early_stopping_patience, 5, "early_stopping_patience")
-    _require_config_float(config.min_delta, 0.001, "min_delta")
-    _require_config_float(config.head_lr_stage1, 3e-4, "head_lr_stage1")
-    _require_config_float(config.head_lr_stage2, 1e-4, "head_lr_stage2")
-    _require_config_float(config.backbone_lr_stage2, 1e-5, "backbone_lr_stage2")
-    _require_config_float(config.weight_decay, 1e-4, "weight_decay")
-    _require_config_value(config.scheduler, "warmup_cosine", "scheduler")
-    _require_config_float(config.warmup_ratio, 0.10, "warmup_ratio")
-    _require_config_float(config.min_lr_factor, 0.01, "min_lr_factor")
-    _require_config_value(config.loss, "asymmetric", "loss")
-    _require_config_float(config.asl_gamma_pos, 0.0, "asl_gamma_pos")
-    _require_config_float(config.asl_gamma_neg, 4.0, "asl_gamma_neg")
-    _require_config_float(config.asl_clip, 0.05, "asl_clip")
-    _require_config_float(config.asl_eps, 1e-8, "asl_eps")
-    if (config.batch_size, config.gradient_accumulation_steps) not in {(256, 1), (128, 2)}:
-        raise ValueError(
-            "Recipe v2 supports only physical batch 256 with accumulation 1, "
-            "or OOM fallback physical batch 128 with accumulation 2."
-        )
-    if config.effective_batch_size != 256:
-        raise ValueError(
-            f"Recipe v2 requires effective batch size 256, got {config.effective_batch_size} "
-            f"from batch_size={config.batch_size} and gradient_accumulation_steps={config.gradient_accumulation_steps}."
-        )
-
-
-def _current_lrs(optimizer: Any) -> dict[str, float | None]:
-    result: dict[str, float | None] = {
-        "learning_rate_cnn_head": None,
-        "learning_rate_denseblock4_norm5": None,
-    }
-    for group in optimizer.param_groups:
-        name = group.get("name")
-        if name == "cnn_head":
-            result["learning_rate_cnn_head"] = float(group["lr"])
-        elif name == "denseblock4_norm5":
-            result["learning_rate_denseblock4_norm5"] = float(group["lr"])
-    return result
-
-
-def _format_lr(value: float | None) -> str:
-    return "NA" if value is None else f"{value:.2e}"
-
-
-def _print_epoch_summary(
-    *,
-    epoch: int,
-    train_loss: float,
-    val_loss: float,
-    val_metrics: dict[str, Any],
-    lrs: dict[str, float | None],
-    improved: bool,
-    patience_counter: int | None = None,
-) -> None:
-    patience_suffix = "" if patience_counter is None else f" patience={patience_counter}"
-    print(
-        "Epoch "
-        f"{epoch} summary: train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
-        f"val_disease_macro_AP={val_metrics['disease_macro_average_precision'] or 0.0:.4f} "
-        f"val_disease_macro_AUROC={val_metrics['disease_macro_auroc'] or 0.0:.4f} "
-        f"head_lr={_format_lr(lrs.get('learning_rate_cnn_head'))} "
-        f"backbone_lr={_format_lr(lrs.get('learning_rate_denseblock4_norm5'))} "
-        f"checkpoint={'best' if improved else 'no'}"
-        f"{patience_suffix}",
-        flush=True,
-    )
-
-
-def train_model(config: TrainingConfig) -> dict[str, Any]:
-    _require_torch()
-    source_labels = load_target_labels(config.target_labels_path)
-    labels = labels_for_target_mode(config.target_mode)
-    if config.gradient_accumulation_steps <= 0:
-        raise ValueError("gradient_accumulation_steps must be positive")
-    validate_recipe_config(config, labels)
-    set_seed(config.seed)
-    device = resolve_device(config.device)
-    amp_enabled = config.use_amp and device.type == "cuda"
-    run_id = create_run_id(config.seed, recipe_variant=config.recipe_variant)
-    run_output_dir = resolve_run_output_dir(config.output_dir, run_id)
-    paths = resolve_artifact_paths(run_output_dir)
-    ensure_artifact_tree(paths)
-    sampler_config = sampler_config_for_manifest(config, labels)
-    train_transform_variant = train_transform_variant_for_recipe(config.recipe_variant)
-
-    loss_config = AsymmetricLossConfig(
-        gamma_pos=config.asl_gamma_pos,
-        gamma_neg=config.asl_gamma_neg,
-        clip=config.asl_clip,
-        eps=config.asl_eps,
-        reduction="mean",
-    ).to_dict()
-    run_config = RunConfig(
-        run_id=run_id,
-        recipe_variant=config.recipe_variant,
-        output_dir=str(paths.output_dir),
-        seed=config.seed,
-        split_manifest_path=str(config.manifest_path),
-        target_labels_path=str(config.target_labels_path),
-        target_mode=config.target_mode,
-        source_target_label_order=source_labels,
-        target_labels=labels,
-        target_label_order=labels,
-        checkpoint_metric="validation_disease_macro_average_precision",
-        checkpoint_selection_metric="validation_disease_macro_average_precision",
-        stage1_epochs_planned=config.stage1_epochs,
-        stage2_min_epochs_before_early_stop=config.stage2_min_epochs_before_early_stop,
-        stage1_config={
-            "stage_name": "cnn_head_only",
-            "epochs": config.stage1_epochs,
-            "head_max_lr": config.head_lr_stage1,
-            "trainable": ["cnn_head", "classifier"],
-            "frozen": ["backbone"],
-            "backbone_batchnorm": "eval",
-            "cnn_head_batchnorm": "train",
-        },
-        stage2_config={
-            "stage_name": "denseblock4_norm5_finetune",
-            "epochs": config.stage2_epochs,
-            "head_max_lr": config.head_lr_stage2,
-            "backbone_max_lr": config.backbone_lr_stage2,
-            "trainable": ["cnn_head", "classifier", "backbone.denseblock4", "backbone.norm5"],
-            "frozen": [
-                "backbone.conv0",
-                "backbone.norm0",
-                "backbone.denseblock1",
-                "backbone.transition1",
-                "backbone.denseblock2",
-                "backbone.transition2",
-                "backbone.denseblock3",
-                "backbone.transition3",
-            ],
-            "backbone_batchnorm": "eval",
-            "cnn_head_batchnorm": "train",
-        },
-        input_size=config.input_size,
-        resize_size=config.resize_size,
-        train_transform_variant=train_transform_variant,
-        physical_batch_size=config.batch_size,
-        gradient_accumulation_steps=config.gradient_accumulation_steps,
-        effective_batch_size=config.effective_batch_size,
-        **runtime_environment_config(device, amp_enabled=amp_enabled),
-        loss_config=loss_config,
-        optimizer_config={
-            "optimizer": "AdamW",
-            "weight_decay": config.weight_decay,
-            "stage1_head_lr": config.head_lr_stage1,
-            "stage2_head_lr": config.head_lr_stage2,
-            "stage2_backbone_lr": config.backbone_lr_stage2,
-        },
-        scheduler_config={
-            "scheduler": "warmup_cosine",
-            "warmup_ratio": config.warmup_ratio,
-            "min_lr_factor": config.min_lr_factor,
-            "step_unit": "optimizer_step",
-        },
-        sampler_config=sampler_config,
-        early_stopping_config={
-            "patience": config.early_stopping_patience,
-            "min_delta": config.min_delta,
-            "stage2_min_epochs_before_early_stop": config.stage2_min_epochs_before_early_stop,
-        },
-    )
-    write_run_config(paths.config_path, run_config)
-    save_json(paths.loss_config_path, loss_config)
-    print(
-        f"Run {run_id} | recipe_variant={config.recipe_variant} "
-        f"train_transform_variant={train_transform_variant} "
-        f"rare_sampler_enabled={sampler_config.get('rare_sampler_enabled')}",
-        flush=True,
-    )
-
-    dataloaders = build_dataloaders(config, labels)
-    model = DenseNet121CNNHead(num_classes=len(labels)).to(device)
-    criterion = create_criterion(config)
-    configure_stage1(model)
-    run_stage0_smoke(model, dataloaders["train"], criterion, device, labels, input_size=config.input_size)
-
-    history: list[dict[str, Any]] = []
-    best_metric = -np.inf
-    best_auroc: float | None = None
-    best_val_loss: float | None = None
-    best_epoch = 0
-    global_epoch = 0
-
-    train_optimizer_steps_per_epoch = optimizer_steps_per_epoch(
-        len(dataloaders["train"]),
-        config.gradient_accumulation_steps,
-    )
-    optimizer = torch.optim.AdamW(
-        stage1_optimizer_parameters(model, config.head_lr_stage1, config.weight_decay)
-    )
-    scheduler = build_warmup_cosine_scheduler(
-        optimizer,
-        total_optimizer_steps=max(config.stage1_epochs * train_optimizer_steps_per_epoch, 1),
-        warmup_ratio=config.warmup_ratio,
-        min_lr_factor=config.min_lr_factor,
-    )
-    for _ in range(config.stage1_epochs):
-        global_epoch += 1
-        print(f"Epoch {global_epoch} | Stage 1/{config.stage1_epochs} cnn_head_only", flush=True)
-        epoch_started_at = time.perf_counter()
-        configure_stage1(model)
-        train_loss = train_one_epoch(
-            model=model,
-            dataloader=dataloaders["train"],
-            criterion=criterion,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            device=device,
-            use_amp=config.use_amp,
-            gradient_accumulation_steps=config.gradient_accumulation_steps,
-            progress_desc=f"train e{global_epoch}",
-        )
-        val_loss, val_metrics = evaluate_loss(
-            model=model,
-            dataloader=dataloaders["val"],
-            criterion=criterion,
-            device=device,
-            labels=labels,
-            progress_desc=f"val   e{global_epoch}",
-        )
-        lrs = _current_lrs(optimizer)
-        metric = val_metrics["disease_macro_average_precision"]
-        improved = checkpoint_candidate_improved(
-            candidate_ap=metric,
-            best_ap=best_metric,
-            min_delta=config.min_delta,
-            has_best=best_epoch != 0,
-            candidate_auroc=val_metrics["disease_macro_auroc"],
-            best_auroc=best_auroc,
-            candidate_val_loss=val_loss,
-            best_val_loss=best_val_loss,
-        )
-        if improved:
-            best_metric = metric if metric is not None else -np.inf
-            best_auroc = val_metrics["disease_macro_auroc"]
-            best_val_loss = val_loss
-            best_epoch = global_epoch
-            torch.save(model.state_dict(), paths.checkpoint_best_path)
-        row = {
-            "run_id": run_id,
-            "epoch": global_epoch,
-            "stage": "cnn_head_only",
-            "train_loss": train_loss,
-            "val_loss": val_loss,
-            **lrs,
-            "learning_rate_denseblock4_norm5": np.nan,
-            "val_disease_macro_auroc": val_metrics["disease_macro_auroc"],
-            "val_disease_macro_average_precision": val_metrics["disease_macro_average_precision"],
-            "is_best_checkpoint": improved,
-            "early_stopping_counter": np.nan,
-            "epoch_duration": time.perf_counter() - epoch_started_at,
-        }
-        for label in labels:
-            slug = label_slug(label)
-            row[f"val_{slug}_average_precision"] = val_metrics["per_label"][label]["average_precision"]
-            row[f"val_{slug}_auroc"] = val_metrics["per_label"][label]["auroc"]
-        history.append(row)
-        _print_epoch_summary(
-            epoch=global_epoch,
-            train_loss=train_loss,
-            val_loss=val_loss,
-            val_metrics=val_metrics,
-            lrs=lrs,
-            improved=improved,
-        )
-
-    stage2_start_epoch = global_epoch + 1
-    run_config.stage2_start_epoch = stage2_start_epoch
-    write_run_config(paths.config_path, run_config)
-    configure_stage2(model)
-    optimizer = torch.optim.AdamW(
-        stage2_optimizer_parameters(
-            model,
-            head_lr=config.head_lr_stage2,
-            backbone_lr=config.backbone_lr_stage2,
-            weight_decay=config.weight_decay,
-        )
-    )
-    scheduler = build_warmup_cosine_scheduler(
-        optimizer,
-        total_optimizer_steps=max(config.stage2_epochs * train_optimizer_steps_per_epoch, 1),
-        warmup_ratio=config.warmup_ratio,
-        min_lr_factor=config.min_lr_factor,
-    )
-    patience_counter = 0
-    for stage2_epoch in range(1, config.stage2_epochs + 1):
-        global_epoch += 1
-        print(f"Epoch {global_epoch} | Stage 2/{config.stage2_epochs} denseblock4_norm5_finetune", flush=True)
-        epoch_started_at = time.perf_counter()
-        configure_stage2(model)
-        train_loss = train_one_epoch(
-            model=model,
-            dataloader=dataloaders["train"],
-            criterion=criterion,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            device=device,
-            use_amp=config.use_amp,
-            gradient_accumulation_steps=config.gradient_accumulation_steps,
-            progress_desc=f"train e{global_epoch}",
-        )
-        val_loss, val_metrics = evaluate_loss(
-            model=model,
-            dataloader=dataloaders["val"],
-            criterion=criterion,
-            device=device,
-            labels=labels,
-            progress_desc=f"val   e{global_epoch}",
-        )
-        lrs = _current_lrs(optimizer)
-        metric = val_metrics["disease_macro_average_precision"]
-        improved = checkpoint_candidate_improved(
-            candidate_ap=metric,
-            best_ap=best_metric,
-            min_delta=config.min_delta,
-            has_best=best_epoch != 0,
-            candidate_auroc=val_metrics["disease_macro_auroc"],
-            best_auroc=best_auroc,
-            candidate_val_loss=val_loss,
-            best_val_loss=best_val_loss,
-        )
-        if improved:
-            best_metric = metric if metric is not None else -np.inf
-            best_auroc = val_metrics["disease_macro_auroc"]
-            best_val_loss = val_loss
-            best_epoch = global_epoch
-            patience_counter = 0
-            torch.save(model.state_dict(), paths.checkpoint_best_path)
-        else:
-            patience_counter += 1
-        row = {
-            "run_id": run_id,
-            "epoch": global_epoch,
-            "stage": "denseblock4_norm5_finetune",
-            "train_loss": train_loss,
-            "val_loss": val_loss,
-            **lrs,
-            "val_disease_macro_auroc": val_metrics["disease_macro_auroc"],
-            "val_disease_macro_average_precision": val_metrics["disease_macro_average_precision"],
-            "is_best_checkpoint": improved,
-            "early_stopping_counter": patience_counter,
-            "epoch_duration": time.perf_counter() - epoch_started_at,
-        }
-        for label in labels:
-            slug = label_slug(label)
-            row[f"val_{slug}_average_precision"] = val_metrics["per_label"][label]["average_precision"]
-            row[f"val_{slug}_auroc"] = val_metrics["per_label"][label]["auroc"]
-        history.append(row)
-        _print_epoch_summary(
-            epoch=global_epoch,
-            train_loss=train_loss,
-            val_loss=val_loss,
-            val_metrics=val_metrics,
-            lrs=lrs,
-            improved=improved,
-            patience_counter=patience_counter,
-        )
-        if stage2_epoch >= config.stage2_min_epochs_before_early_stop and patience_counter >= config.early_stopping_patience:
-            print(
-                "Early stopping: "
-                f"stage2_epoch={stage2_epoch} patience={patience_counter}/{config.early_stopping_patience}",
-                flush=True,
-            )
-            break
-
-    pd.DataFrame(history).to_csv(paths.training_history_path, index=False)
-    model.load_state_dict(torch.load(paths.checkpoint_best_path, map_location=device))
-    val_frame_05 = run_inference(
-        model,
-        dataloaders["val"],
-        device=device,
-        thresholds={label: 0.5 for label in labels},
-        labels=labels,
-        run_id=run_id,
-        progress_desc="infer val thresholds",
-    )
-    y_true = val_frame_05[[f"true_{label_slug(label)}" for label in labels]].to_numpy(dtype=int)
-    y_prob = val_frame_05[[f"prob_{label_slug(label)}" for label in labels]].to_numpy(dtype=float)
-    thresholds_payload = select_validation_thresholds(y_true, y_prob, labels=labels, run_id=run_id)
-    save_json(paths.thresholds_path, thresholds_payload)
-    selected_thresholds = thresholds_by_label(thresholds_payload, labels)
-    val_frame = run_inference(
-        model,
-        dataloaders["val"],
-        device=device,
-        thresholds=selected_thresholds,
-        labels=labels,
-        run_id=run_id,
-        progress_desc="infer val final",
-    )
-    test_frame = run_inference(
-        model,
-        dataloaders["test"],
-        device=device,
-        thresholds=selected_thresholds,
-        labels=labels,
-        run_id=run_id,
-        progress_desc="infer test final",
-    )
-    val_frame.to_csv(paths.predictions_val_path, index=False)
-    test_frame.to_csv(paths.predictions_test_path, index=False)
-    save_json(paths.metrics_val_path, evaluate_prediction_frame(val_frame, labels=labels, run_id=run_id))
-    save_json(paths.metrics_test_path, evaluate_prediction_frame(test_frame, labels=labels, run_id=run_id))
-    return {
-        "run_id": run_id,
-        "output_dir": str(paths.output_dir),
-        "best_epoch": best_epoch,
-        "best_validation_disease_macro_average_precision": best_metric,
-    }
+def _require_torch() -> None:
+    if torch is None:
+        raise ModuleNotFoundError("PyTorch and torchvision are required to train DenseNet121.")

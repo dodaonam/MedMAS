@@ -7,8 +7,8 @@ MedMAS contains local utilities for chest X-ray preprocessing, exploratory analy
 ```text
 src/preprocess_image/      Preprocess manifest, target labels, patient-wise split, and audit helpers
 src/eda_image/             Image EDA, metadata summaries, and quality analysis helpers
-src/train_densenet/        DenseNet121 + CNN-head training, evaluation, metrics, thresholds, and Grad-CAM helpers
-src/visualize_densenet/    Figure generation from saved DenseNet training artifacts
+src/train_densenet/        Simple DenseNet121 fine-tuning pipeline
+src/visualize_densenet/    Basic figures from saved DenseNet training artifacts
 scripts/                   CLI entrypoints
 tests/                     Unit tests
 notebook/                  Analysis and visualization notebooks
@@ -54,7 +54,7 @@ uv run python scripts/train_densenet121_cnn_head.py
 Training outputs are written under:
 
 ```text
-artifacts/training/densenet121_cnn_head/
+artifacts/training/densenet121/
 ```
 
 ## Visualization
@@ -65,8 +65,4 @@ After a training run has produced saved artifacts:
 uv run python scripts/visualize_densenet121_cnn_head.py
 ```
 
-Grad-CAM figures can be generated when `checkpoint_best.pt` exists:
-
-```bash
-uv run python scripts/visualize_densenet121_cnn_head.py --include-gradcam
-```
+Visualization reads `config.json`, `training_history.csv`, predictions, and metrics from the latest run directory.
