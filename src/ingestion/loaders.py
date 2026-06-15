@@ -6,7 +6,7 @@ from typing import Any, Mapping, Sequence, cast
 import pandas as pd
 from langchain_core.documents import Document
 
-from ingestion.chunking import article_row_to_documents
+from ingestion.splitter import article_row_to_documents
 from ingestion.common import (
     DEFAULT_CHUNK_OVERLAP,
     DEFAULT_MAX_CHARS,
