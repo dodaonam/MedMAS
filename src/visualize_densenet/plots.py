@@ -46,6 +46,9 @@ def create_data_plots(manifest: pd.DataFrame, figures_dir: Path, labels: list[st
 
 def create_training_plots(history: pd.DataFrame, figures_dir: Path) -> list[Path]:
     paths = [plot_loss_curve(history, figures_dir)]
+    learning_rate_path = plot_learning_rate_curve(history, figures_dir)
+    if learning_rate_path is not None:
+        paths.append(learning_rate_path)
     metric_path = plot_validation_metrics(history, figures_dir)
     if metric_path is not None:
         paths.append(metric_path)
@@ -120,6 +123,18 @@ def plot_loss_curve(history: pd.DataFrame, figures_dir: Path) -> Path:
     return _save(fig, figures_dir / "01_training" / "loss_curve.png")
 
 
+def plot_learning_rate_curve(history: pd.DataFrame, figures_dir: Path) -> Path | None:
+    if "learning_rate" not in history.columns:
+        return None
+    fig, ax = plt.subplots(figsize=(8, 4.5))
+    ax.plot(history["epoch"], history["learning_rate"], marker="o")
+    ax.set_xlabel("epoch")
+    ax.set_ylabel("learning rate")
+    ax.set_title("Learning rate schedule")
+    ax.ticklabel_format(axis="y", style="sci", scilimits=(0, 0))
+    return _save(fig, figures_dir / "01_training" / "learning_rate_curve.png")
+
+
 def plot_validation_metrics(history: pd.DataFrame, figures_dir: Path) -> Path | None:
     columns = [
         "val_macro_average_precision",
@@ -190,10 +205,11 @@ def plot_probability_histograms(predictions: pd.DataFrame, figures_dir: Path, la
         slug = label_slug(label)
         true_col = f"true_{slug}"
         prob_col = f"prob_{slug}"
+        threshold = prediction_threshold(predictions, label)
         ax.axis("on")
         ax.hist(predictions.loc[predictions[true_col] == 0, prob_col], bins=20, alpha=0.65, label="true 0")
         ax.hist(predictions.loc[predictions[true_col] == 1, prob_col], bins=20, alpha=0.65, label="true 1")
-        ax.axvline(0.5, color="0.2", linestyle="--", linewidth=1)
+        ax.axvline(threshold, color="0.2", linestyle="--", linewidth=1)
         ax.set_title(label)
         ax.set_xlim(0, 1)
         ax.legend(fontsize=7)
@@ -278,6 +294,19 @@ def _metric_value(value: Any) -> float:
     if value is None or (isinstance(value, float) and np.isnan(value)):
         return 0.0
     return float(value)
+
+
+def prediction_threshold(predictions: pd.DataFrame, label: str) -> float:
+    slug = label_slug(label)
+    column = f"threshold_{slug}"
+    if column not in predictions.columns:
+        return 0.5
+    values = predictions[column].dropna().astype(float).unique().tolist()
+    if not values:
+        return 0.5
+    if len(values) > 1:
+        raise ValueError(f"Multiple threshold values found for {label!r}: {values}")
+    return float(values[0])
 
 
 def _save(fig: Any, path: Path) -> Path:

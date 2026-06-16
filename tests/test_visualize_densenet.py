@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from train_densenet import TARGET_LABELS, artifact_paths, label_slug, save_json
 from visualize_densenet.data import load_visualization_artifacts
+from visualize_densenet.plots import create_training_plots, prediction_threshold
 
 
 class DenseNetVisualizationTests(unittest.TestCase):
@@ -31,6 +32,7 @@ class DenseNetVisualizationTests(unittest.TestCase):
                         "epoch": 1,
                         "train_loss": 1.0,
                         "val_loss": 0.8,
+                        "learning_rate": 1e-4,
                         "val_macro_average_precision": 0.5,
                         "val_macro_auroc": 0.6,
                         "val_macro_f1": 0.4,
@@ -62,6 +64,48 @@ class DenseNetVisualizationTests(unittest.TestCase):
             save_json(paths.metrics_test_path, {**metrics, "run_id": "other"})
             with self.assertRaisesRegex(ValueError, "Run ID mismatch"):
                 load_visualization_artifacts(run_dir, labels_path)
+
+    def test_create_training_plots_includes_learning_rate_curve_when_available(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            figures_dir = Path(tmp) / "figures"
+            history = pd.DataFrame(
+                [
+                    {
+                        "epoch": 1,
+                        "train_loss": 1.0,
+                        "val_loss": 0.9,
+                        "learning_rate": 1e-5,
+                        "val_macro_average_precision": 0.4,
+                        "val_macro_auroc": 0.5,
+                        "val_macro_f1": 0.3,
+                    },
+                    {
+                        "epoch": 2,
+                        "train_loss": 0.8,
+                        "val_loss": 0.7,
+                        "learning_rate": 1e-4,
+                        "val_macro_average_precision": 0.6,
+                        "val_macro_auroc": 0.7,
+                        "val_macro_f1": 0.5,
+                    },
+                ]
+            )
+
+            paths = create_training_plots(history, figures_dir)
+            self.assertEqual(
+                sorted(path.name for path in paths),
+                ["learning_rate_curve.png", "loss_curve.png", "validation_metrics.png"],
+            )
+            for path in paths:
+                self.assertTrue(path.is_file(), str(path))
+
+    def test_prediction_threshold_reads_saved_per_label_value(self) -> None:
+        predictions = _prediction_frame("unit")
+        predictions["threshold_no_finding"] = 0.7
+        predictions["threshold_infiltration"] = 0.35
+
+        self.assertEqual(prediction_threshold(predictions, "No Finding"), 0.7)
+        self.assertEqual(prediction_threshold(predictions, "Infiltration"), 0.35)
 
 
 def _prediction_frame(run_id: str) -> pd.DataFrame:

@@ -51,6 +51,8 @@ uv run python scripts/train_densenet121_cnn_head.py --dry-run-smoke
 uv run python scripts/train_densenet121_cnn_head.py
 ```
 
+The training CLI defaults to `20` epochs with `2` epochs of linear warmup followed by cosine learning-rate decay. Final validation and test exports tune one threshold per label on the validation split by maximizing per-label F1, and reuse those tuned thresholds for test predictions.
+
 Training outputs are written under:
 
 ```text
@@ -65,4 +67,4 @@ After a training run has produced saved artifacts:
 uv run python scripts/visualize_densenet121_cnn_head.py
 ```
 
-Visualization reads `config.json`, `training_history.csv`, predictions, and metrics from the latest run directory.
+Visualization reads `config.json`, `training_history.csv`, predictions, and metrics from the latest run directory, including the learning-rate curve and the saved per-label thresholds.
