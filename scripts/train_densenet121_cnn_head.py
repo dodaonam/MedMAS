@@ -15,13 +15,21 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-labels-path", type=Path, default=ROOT / "artifacts" / "preprocess" / "target_labels.json")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "artifacts" / "training" / "densenet121")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
-    parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--warmup-epochs", type=int, default=2)
+    parser.add_argument("--warmup-start-factor", type=float, default=0.1)
+    parser.add_argument("--min-lr", type=float, default=1e-6)
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.5,
+        help="Fallback threshold before per-label validation tuning, and fallback for labels that cannot be tuned.",
+    )
     parser.add_argument("--device", default=None, help="Example: cuda, cuda:0, or cpu. Defaults to CUDA when available.")
     parser.add_argument("--no-pretrained", action="store_true", help="Do not load ImageNet weights.")
     parser.add_argument("--dry-run-smoke", action="store_true", help="Build data/model and run one forward pass.")
@@ -48,6 +56,9 @@ def main(argv: list[str] | None = None) -> int:
         image_size=args.image_size,
         lr=args.lr,
         weight_decay=args.weight_decay,
+        warmup_epochs=args.warmup_epochs,
+        warmup_start_factor=args.warmup_start_factor,
+        min_lr=args.min_lr,
         threshold=args.threshold,
         pretrained=not args.no_pretrained,
         device=args.device,

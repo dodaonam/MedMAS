@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from train_densenet import (
     TARGET_LABELS,
+    TrainConfig,
     artifact_paths,
     auroc,
     average_precision,
@@ -87,6 +88,21 @@ class DenseNetSimpleTests(unittest.TestCase):
         self.assertEqual(average_precision([0, 0], [0.1, 0.2]), None)
         self.assertEqual(auroc([1, 1], [0.8, 0.9]), None)
 
+    def test_tune_thresholds_and_metrics_support_per_label_thresholds(self) -> None:
+        y_true = np.array([[1, 0], [1, 1], [0, 1], [0, 0]])
+        y_prob = np.array([[0.9, 0.3], [0.8, 0.8], [0.7, 0.4], [0.1, 0.1]])
+
+        thresholds = train_module.tune_thresholds(y_true, y_prob, ["A", "B"], default_threshold=0.5)
+        self.assertEqual(thresholds, {"A": 0.8, "B": 0.4})
+
+        metrics = compute_metrics(y_true, y_prob, ["A", "B"], threshold=thresholds, run_id="unit")
+        self.assertEqual(metrics["threshold"], None)
+        self.assertEqual(metrics["threshold_mode"], "per_label")
+        self.assertEqual(metrics["thresholds"], thresholds)
+        self.assertEqual(metrics["per_label"]["A"]["threshold"], 0.8)
+        self.assertEqual(metrics["per_label"]["B"]["threshold"], 0.4)
+        self.assertEqual(metrics["macro_f1"], 1.0)
+
     def test_checkpoint_load_allows_script_metadata(self) -> None:
         calls = []
 
@@ -104,6 +120,47 @@ class DenseNetSimpleTests(unittest.TestCase):
 
         self.assertEqual(checkpoint, {"model_state_dict": {}})
         self.assertEqual(calls[0][1]["weights_only"], False)
+
+    def test_config_to_json_includes_scheduler_fields(self) -> None:
+        config = TrainConfig(
+            root=Path("/tmp/root"),
+            manifest_path=Path("/tmp/manifest.csv"),
+            target_labels_path=Path("/tmp/labels.json"),
+            output_dir=Path("/tmp/output"),
+        )
+
+        payload = train_module._config_to_json(config)
+        self.assertEqual(payload["epochs"], 20)
+        self.assertEqual(payload["warmup_epochs"], 2)
+        self.assertEqual(payload["warmup_start_factor"], 0.1)
+        self.assertEqual(payload["min_lr"], 1e-6)
+
+    @unittest.skipIf(train_module.torch is None, "torch not installed")
+    def test_build_lr_scheduler_warmup_then_cosine_uses_min_lr_in_last_epoch(self) -> None:
+        parameter = train_module.torch.nn.Parameter(train_module.torch.tensor(1.0))
+        optimizer = train_module.torch.optim.AdamW([parameter], lr=1e-4)
+        config = TrainConfig(
+            root=Path("/tmp/root"),
+            manifest_path=Path("/tmp/manifest.csv"),
+            target_labels_path=Path("/tmp/labels.json"),
+            output_dir=Path("/tmp/output"),
+            epochs=20,
+            warmup_epochs=2,
+            warmup_start_factor=0.1,
+            min_lr=1e-6,
+        )
+
+        scheduler = train_module.build_lr_scheduler(optimizer, config)
+        used_lrs = []
+        for _ in range(config.epochs):
+            used_lrs.append(float(optimizer.param_groups[0]["lr"]))
+            optimizer.step()
+            scheduler.step()
+
+        self.assertAlmostEqual(used_lrs[0], 1e-5, places=12)
+        self.assertAlmostEqual(used_lrs[1], 5.5e-5, places=12)
+        self.assertAlmostEqual(used_lrs[2], 1e-4, places=12)
+        self.assertAlmostEqual(used_lrs[-1], 1e-6, places=12)
 
 
 if __name__ == "__main__":

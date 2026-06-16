@@ -4,6 +4,7 @@ import json
 import random
 import re
 import time
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -46,12 +47,15 @@ class TrainConfig:
     target_labels_path: Path
     output_dir: Path
     seed: int = 0
-    epochs: int = 10
+    epochs: int = 20
     batch_size: int = 32
     num_workers: int = 4
     image_size: int = 224
     lr: float = 1e-4
     weight_decay: float = 1e-4
+    warmup_epochs: int = 2
+    warmup_start_factor: float = 0.1
+    min_lr: float = 1e-6
     threshold: float = 0.5
     pretrained: bool = True
     device: str | None = None
@@ -245,6 +249,35 @@ def build_model(num_labels: int, *, pretrained: bool = True) -> Any:
     return model
 
 
+def build_lr_scheduler(optimizer: Any, config: TrainConfig) -> Any:
+    _require_torch()
+    from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
+
+    if config.epochs < 1:
+        raise ValueError("epochs must be at least 1")
+    if config.warmup_epochs < 0:
+        raise ValueError("warmup_epochs must be non-negative")
+    if config.warmup_epochs >= config.epochs:
+        raise ValueError("warmup_epochs must be smaller than epochs")
+    if not 0.0 < config.warmup_start_factor <= 1.0:
+        raise ValueError("warmup_start_factor must be in (0, 1]")
+    if config.min_lr < 0.0:
+        raise ValueError("min_lr must be non-negative")
+
+    cosine_t_max = _cosine_t_max(config)
+    if config.warmup_epochs == 0:
+        return CosineAnnealingLR(optimizer, T_max=cosine_t_max, eta_min=config.min_lr)
+
+    warmup = LinearLR(
+        optimizer,
+        start_factor=config.warmup_start_factor,
+        end_factor=1.0,
+        total_iters=config.warmup_epochs,
+    )
+    cosine = CosineAnnealingLR(optimizer, T_max=cosine_t_max, eta_min=config.min_lr)
+    return SequentialLR(optimizer, schedulers=[warmup, cosine], milestones=[config.warmup_epochs])
+
+
 def train_model(config: TrainConfig) -> dict[str, Any]:
     _require_torch()
     labels = load_target_labels(config.target_labels_path)
@@ -260,11 +293,15 @@ def train_model(config: TrainConfig) -> dict[str, Any]:
     model = build_model(len(labels), pretrained=config.pretrained).to(device)
     criterion = torch.nn.BCEWithLogitsLoss(pos_weight=positive_weights(frame, labels).to(device))
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
+    scheduler = build_lr_scheduler(optimizer, config)
 
     config_payload = {
         **_config_to_json(config),
         "run_id": run_id,
         "model_name": MODEL_NAME,
+        "lr_scheduler": _scheduler_name(config),
+        "cosine_t_max": _cosine_t_max(config),
+        "threshold_strategy": "per_label_f1_from_val",
         "target_labels": labels,
         "threshold": config.threshold,
         "best_checkpoint": str(paths.checkpoint_path),
@@ -278,6 +315,7 @@ def train_model(config: TrainConfig) -> dict[str, Any]:
     best_epoch = 0
     for epoch in range(1, config.epochs + 1):
         start = time.time()
+        epoch_lr = float(optimizer.param_groups[0]["lr"])
         train_loss = train_one_epoch(
             model,
             train_loader,
@@ -296,11 +334,20 @@ def train_model(config: TrainConfig) -> dict[str, Any]:
             run_id=run_id,
             desc=f"epoch {epoch}/{config.epochs} val",
         )
-        val_metrics = compute_metrics(y_true, y_prob, labels, threshold=config.threshold, run_id=run_id)
+        val_thresholds = tune_thresholds(y_true, y_prob, labels, default_threshold=config.threshold)
+        val_metrics = compute_metrics(y_true, y_prob, labels, threshold=val_thresholds, run_id=run_id)
         score = _score_for_checkpoint(val_metrics, val_loss)
         if score > best_score:
             best_score = score
             best_epoch = epoch
+            tuned_val_frame = prediction_frame(
+                metadata_rows_from_prediction_frame(val_frame),
+                y_true,
+                y_prob,
+                labels,
+                threshold=val_thresholds,
+                run_id=run_id,
+            )
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
@@ -311,7 +358,7 @@ def train_model(config: TrainConfig) -> dict[str, Any]:
                 },
                 paths.checkpoint_path,
             )
-            val_frame.to_csv(paths.predictions_val_path, index=False)
+            tuned_val_frame.to_csv(paths.predictions_val_path, index=False)
             save_json(paths.metrics_val_path, val_metrics)
 
         row = {
@@ -322,7 +369,7 @@ def train_model(config: TrainConfig) -> dict[str, Any]:
             "val_macro_average_precision": val_metrics["macro_average_precision"],
             "val_macro_auroc": val_metrics["macro_auroc"],
             "val_macro_f1": val_metrics["macro_f1"],
-            "learning_rate": optimizer.param_groups[0]["lr"],
+            "learning_rate": epoch_lr,
             "epoch_seconds": round(time.time() - start, 3),
         }
         history.append(row)
@@ -332,6 +379,7 @@ def train_model(config: TrainConfig) -> dict[str, Any]:
             f"train_loss={train_loss:.4f} val_loss={val_loss:.4f} "
             f"val_macro_ap={_fmt_metric(row['val_macro_average_precision'])}"
         )
+        scheduler.step()
 
     checkpoint = load_checkpoint(paths.checkpoint_path, map_location=device)
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -345,6 +393,15 @@ def train_model(config: TrainConfig) -> dict[str, Any]:
         run_id=run_id,
         desc="best val",
     )
+    tuned_thresholds = tune_thresholds(val_true, val_prob, labels, default_threshold=config.threshold)
+    val_frame = prediction_frame(
+        metadata_rows_from_prediction_frame(val_frame),
+        val_true,
+        val_prob,
+        labels,
+        threshold=tuned_thresholds,
+        run_id=run_id,
+    )
     test_loss, test_frame, test_true, test_prob = predict(
         model,
         test_loader,
@@ -355,10 +412,20 @@ def train_model(config: TrainConfig) -> dict[str, Any]:
         run_id=run_id,
         desc="test",
     )
-    val_metrics = compute_metrics(val_true, val_prob, labels, threshold=config.threshold, run_id=run_id)
-    test_metrics = compute_metrics(test_true, test_prob, labels, threshold=config.threshold, run_id=run_id)
+    test_frame = prediction_frame(
+        metadata_rows_from_prediction_frame(test_frame),
+        test_true,
+        test_prob,
+        labels,
+        threshold=tuned_thresholds,
+        run_id=run_id,
+    )
+    val_metrics = compute_metrics(val_true, val_prob, labels, threshold=tuned_thresholds, run_id=run_id)
+    test_metrics = compute_metrics(test_true, test_prob, labels, threshold=tuned_thresholds, run_id=run_id)
     val_metrics["loss"] = val_loss
     test_metrics["loss"] = test_loss
+    config_payload["selected_thresholds"] = tuned_thresholds
+    save_json(paths.config_path, config_payload)
 
     val_frame.to_csv(paths.predictions_val_path, index=False)
     test_frame.to_csv(paths.predictions_test_path, index=False)
@@ -374,6 +441,7 @@ def train_model(config: TrainConfig) -> dict[str, Any]:
         "test_macro_average_precision": test_metrics["macro_average_precision"],
         "test_macro_auroc": test_metrics["macro_auroc"],
         "test_macro_f1": test_metrics["macro_f1"],
+        "selected_thresholds": tuned_thresholds,
     }
 
 
@@ -414,6 +482,15 @@ def finalize_run(config: TrainConfig, run_dir: Path) -> dict[str, Any]:
         run_id=run_id,
         desc="best val",
     )
+    tuned_thresholds = tune_thresholds(val_true, val_prob, labels, default_threshold=threshold)
+    val_frame = prediction_frame(
+        metadata_rows_from_prediction_frame(val_frame),
+        val_true,
+        val_prob,
+        labels,
+        threshold=tuned_thresholds,
+        run_id=run_id,
+    )
     test_loss, test_frame, test_true, test_prob = predict(
         model,
         test_loader,
@@ -424,10 +501,21 @@ def finalize_run(config: TrainConfig, run_dir: Path) -> dict[str, Any]:
         run_id=run_id,
         desc="test",
     )
-    val_metrics = compute_metrics(val_true, val_prob, labels, threshold=threshold, run_id=run_id)
-    test_metrics = compute_metrics(test_true, test_prob, labels, threshold=threshold, run_id=run_id)
+    test_frame = prediction_frame(
+        metadata_rows_from_prediction_frame(test_frame),
+        test_true,
+        test_prob,
+        labels,
+        threshold=tuned_thresholds,
+        run_id=run_id,
+    )
+    val_metrics = compute_metrics(val_true, val_prob, labels, threshold=tuned_thresholds, run_id=run_id)
+    test_metrics = compute_metrics(test_true, test_prob, labels, threshold=tuned_thresholds, run_id=run_id)
     val_metrics["loss"] = val_loss
     test_metrics["loss"] = test_loss
+    run_config["selected_thresholds"] = tuned_thresholds
+    run_config["threshold_strategy"] = "per_label_f1_from_val"
+    save_json(paths.config_path, run_config)
     val_frame.to_csv(paths.predictions_val_path, index=False)
     test_frame.to_csv(paths.predictions_test_path, index=False)
     save_json(paths.metrics_val_path, val_metrics)
@@ -439,6 +527,7 @@ def finalize_run(config: TrainConfig, run_dir: Path) -> dict[str, Any]:
         "test_macro_average_precision": test_metrics["macro_average_precision"],
         "test_macro_auroc": test_metrics["macro_auroc"],
         "test_macro_f1": test_metrics["macro_f1"],
+        "selected_thresholds": tuned_thresholds,
     }
 
 
@@ -561,9 +650,10 @@ def prediction_frame(
     y_prob: np.ndarray,
     labels: list[str],
     *,
-    threshold: float,
+    threshold: float | Mapping[str, float],
     run_id: str,
 ) -> pd.DataFrame:
+    thresholds = resolve_thresholds(labels, threshold)
     rows: list[dict[str, Any]] = []
     for idx, metadata in enumerate(metadata_rows):
         row = dict(metadata)
@@ -571,11 +661,12 @@ def prediction_frame(
         for label_idx, label in enumerate(labels):
             slug = label_slug(label)
             probability = float(y_prob[idx, label_idx])
+            label_threshold = thresholds[label]
             row[label] = int(y_true[idx, label_idx])
             row[f"true_{slug}"] = int(y_true[idx, label_idx])
             row[f"prob_{slug}"] = probability
-            row[f"threshold_{slug}"] = float(threshold)
-            row[f"pred_{slug}"] = int(probability >= threshold)
+            row[f"threshold_{slug}"] = label_threshold
+            row[f"pred_{slug}"] = int(probability >= label_threshold)
         rows.append(row)
     return pd.DataFrame(rows)
 
@@ -598,6 +689,11 @@ def metadata_to_rows(metadata: Any, batch_size: int) -> list[dict[str, Any]]:
     return rows
 
 
+def metadata_rows_from_prediction_frame(frame: pd.DataFrame) -> list[dict[str, Any]]:
+    columns = [column for column in METADATA_COLUMNS if column in frame.columns]
+    return frame.loc[:, columns].to_dict(orient="records")
+
+
 def positive_weights(frame: pd.DataFrame, labels: list[str]) -> Any:
     _require_torch()
     train = frame.loc[frame["split"].astype(str) == "train", labels].to_numpy(dtype=np.float32)
@@ -612,7 +708,7 @@ def compute_metrics(
     y_prob: Any,
     labels: list[str],
     *,
-    threshold: float = 0.5,
+    threshold: float | Mapping[str, float] = 0.5,
     run_id: str | None = None,
 ) -> dict[str, Any]:
     true = np.asarray(y_true, dtype=int)
@@ -622,10 +718,12 @@ def compute_metrics(
     if true.ndim != 2 or true.shape[1] != len(labels):
         raise ValueError(f"Expected shape [n, {len(labels)}], got {true.shape}")
 
+    thresholds = resolve_thresholds(labels, threshold)
     per_label: dict[str, Any] = {}
     micro_counts = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
     for index, label in enumerate(labels):
-        pred = (prob[:, index] >= threshold).astype(int)
+        label_threshold = thresholds[label]
+        pred = (prob[:, index] >= label_threshold).astype(int)
         counts = confusion_counts(true[:, index], pred)
         for key in micro_counts:
             micro_counts[key] += counts[key]
@@ -634,15 +732,18 @@ def compute_metrics(
             **counts,
             **basic,
             "positive_count": int(np.sum(true[:, index] == 1)),
-            "threshold": float(threshold),
+            "threshold": label_threshold,
             "average_precision": average_precision(true[:, index], prob[:, index]),
             "auroc": auroc(true[:, index], prob[:, index]),
         }
 
+    common_threshold = shared_threshold(thresholds)
     return {
         "run_id": run_id,
         "labels": labels,
-        "threshold": float(threshold),
+        "threshold": common_threshold,
+        "threshold_mode": "fixed" if common_threshold is not None else "per_label",
+        "thresholds": thresholds,
         "per_label": per_label,
         "macro_precision": mean_defined(item["precision"] for item in per_label.values()),
         "macro_recall": mean_defined(item["recall"] for item in per_label.values()),
@@ -706,6 +807,87 @@ def mean_defined(values: Any) -> float | None:
     return float(np.mean(defined))
 
 
+def resolve_thresholds(labels: list[str], threshold: float | Mapping[str, float]) -> dict[str, float]:
+    if isinstance(threshold, Mapping):
+        missing = [label for label in labels if label not in threshold]
+        if missing:
+            raise ValueError(f"Missing thresholds for labels: {missing}")
+        return {label: float(threshold[label]) for label in labels}
+    return {label: float(threshold) for label in labels}
+
+
+def shared_threshold(thresholds: Mapping[str, float]) -> float | None:
+    values = [float(value) for value in thresholds.values()]
+    if not values:
+        return None
+    first = values[0]
+    if all(value == first for value in values[1:]):
+        return first
+    return None
+
+
+def tune_thresholds(
+    y_true: Any,
+    y_prob: Any,
+    labels: list[str],
+    *,
+    default_threshold: float = 0.5,
+) -> dict[str, float]:
+    true = np.asarray(y_true, dtype=int)
+    prob = np.asarray(y_prob, dtype=float)
+    if true.shape != prob.shape:
+        raise ValueError(f"Shape mismatch: y_true {true.shape}, y_prob {prob.shape}")
+    if true.ndim != 2 or true.shape[1] != len(labels):
+        raise ValueError(f"Expected shape [n, {len(labels)}], got {true.shape}")
+    return {
+        label: tune_binary_threshold(true[:, index], prob[:, index], default_threshold=default_threshold)
+        for index, label in enumerate(labels)
+    }
+
+
+def tune_binary_threshold(y_true: Any, y_prob: Any, *, default_threshold: float = 0.5) -> float:
+    true = np.asarray(y_true, dtype=int)
+    prob = np.asarray(y_prob, dtype=float)
+    positives = int(np.sum(true == 1))
+    negatives = int(np.sum(true == 0))
+    if positives == 0 or negatives == 0:
+        return float(default_threshold)
+
+    order = np.argsort(-prob, kind="mergesort")
+    sorted_true = true[order]
+    sorted_prob = prob[order]
+    tp = 0
+    fp = 0
+    best_f1 = -1.0
+    best_threshold = float(default_threshold)
+    index = 0
+    while index < len(sorted_prob):
+        threshold = float(sorted_prob[index])
+        while index < len(sorted_prob) and sorted_prob[index] == threshold:
+            if sorted_true[index] == 1:
+                tp += 1
+            else:
+                fp += 1
+            index += 1
+        fn = positives - tp
+        precision = tp / (tp + fp) if tp + fp else 0.0
+        recall = tp / (tp + fn) if tp + fn else 0.0
+        f1 = 2 * precision * recall / (precision + recall) if precision + recall else 0.0
+        if f1 > best_f1 + 1e-12:
+            best_f1 = f1
+            best_threshold = threshold
+            continue
+        if abs(f1 - best_f1) > 1e-12:
+            continue
+        current_distance = abs(best_threshold - default_threshold)
+        candidate_distance = abs(threshold - default_threshold)
+        if candidate_distance < current_distance or (
+            candidate_distance == current_distance and threshold > best_threshold
+        ):
+            best_threshold = threshold
+    return best_threshold
+
+
 def set_seed(seed: int) -> None:
     _require_torch()
     random.seed(seed)
@@ -727,6 +909,14 @@ def _score_for_checkpoint(metrics: dict[str, Any], val_loss: float) -> float:
     if macro_ap is not None:
         return float(macro_ap)
     return -float(val_loss)
+
+
+def _scheduler_name(config: TrainConfig) -> str:
+    return "linear_warmup_cosine_annealing" if config.warmup_epochs > 0 else "cosine_annealing"
+
+
+def _cosine_t_max(config: TrainConfig) -> int:
+    return max(config.epochs - config.warmup_epochs - 1, 1)
 
 
 def _config_to_json(config: TrainConfig) -> dict[str, Any]:
