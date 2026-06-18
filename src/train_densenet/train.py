@@ -41,6 +41,15 @@ IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 MIN_TUNED_THRESHOLD_POSITIVES = 50
 THRESHOLD_PRIOR_SEARCH_RADIUS = 0.10
+LABEL_THRESHOLD_PRIORS = {
+    "No Finding": 0.31707045435905457,
+    "Infiltration": 0.46902427077293396,
+    "Effusion": 0.5468099117279053,
+    "Atelectasis": 0.36542871594429016,
+    "Nodule": 0.6589330434799194,
+    "Mass": 0.5728916525840759,
+}
+DYNAMIC_THRESHOLD_PRIOR_LABELS = {"Infiltration"}
 
 
 @dataclass
@@ -346,7 +355,7 @@ def train_model(config: TrainConfig) -> dict[str, Any]:
             y_prob,
             labels,
             default_threshold=config.threshold,
-            low_support_threshold=derive_threshold_priors(y_true, y_prob, labels, default_threshold=config.threshold),
+            low_support_threshold=threshold_priors(y_true, y_prob, labels, default_threshold=config.threshold),
             min_positives_for_tuning=MIN_TUNED_THRESHOLD_POSITIVES,
         )
         tuned_val_frame = prediction_frame(
@@ -413,7 +422,7 @@ def train_model(config: TrainConfig) -> dict[str, Any]:
         val_prob,
         labels,
         default_threshold=config.threshold,
-        low_support_threshold=derive_threshold_priors(val_true, val_prob, labels, default_threshold=config.threshold),
+        low_support_threshold=threshold_priors(val_true, val_prob, labels, default_threshold=config.threshold),
         min_positives_for_tuning=MIN_TUNED_THRESHOLD_POSITIVES,
     )
     val_frame = prediction_frame(
@@ -512,7 +521,7 @@ def finalize_run(config: TrainConfig, run_dir: Path) -> dict[str, Any]:
         val_prob,
         labels,
         default_threshold=threshold,
-        low_support_threshold=derive_threshold_priors(val_true, val_prob, labels, default_threshold=threshold),
+        low_support_threshold=threshold_priors(val_true, val_prob, labels, default_threshold=threshold),
         min_positives_for_tuning=MIN_TUNED_THRESHOLD_POSITIVES,
     )
     val_frame = prediction_frame(
@@ -931,7 +940,7 @@ def resolve_thresholds(labels: list[str], threshold: float | Mapping[str, float]
     return {label: float(threshold) for label in labels}
 
 
-def derive_threshold_priors(
+def threshold_priors(
     y_true: Any,
     y_prob: Any,
     labels: list[str],
@@ -944,10 +953,15 @@ def derive_threshold_priors(
         raise ValueError(f"Shape mismatch: y_true {true.shape}, y_prob {prob.shape}")
     if true.ndim != 2 or true.shape[1] != len(labels):
         raise ValueError(f"Expected shape [n, {len(labels)}], got {true.shape}")
-    return {
-        label: prevalence_matched_threshold(true[:, index], prob[:, index], default_threshold=default_threshold)
-        for index, label in enumerate(labels)
-    }
+    priors = resolve_thresholds(labels, default_threshold)
+    for label, prior in LABEL_THRESHOLD_PRIORS.items():
+        if label in priors:
+            priors[label] = float(prior)
+    for index, label in enumerate(labels):
+        if label not in DYNAMIC_THRESHOLD_PRIOR_LABELS:
+            continue
+        priors[label] = prevalence_matched_threshold(true[:, index], prob[:, index], default_threshold=priors[label])
+    return priors
 
 
 def prevalence_matched_threshold(y_true: Any, y_prob: Any, *, default_threshold: float = 0.5) -> float:
@@ -1099,8 +1113,8 @@ def _scheduler_name(config: TrainConfig) -> str:
 
 def _threshold_strategy_name() -> str:
     if MIN_TUNED_THRESHOLD_POSITIVES <= 0:
-        return "per_label_f1_from_val_bounded_by_rate_matched_prior"
-    return f"per_label_f1_from_val_bounded_by_rate_matched_prior_min_positives_{MIN_TUNED_THRESHOLD_POSITIVES}"
+        return "per_label_f1_from_val_bounded_by_label_priors"
+    return f"per_label_f1_from_val_bounded_by_label_priors_min_positives_{MIN_TUNED_THRESHOLD_POSITIVES}"
 
 
 def _cosine_t_max(config: TrainConfig) -> int:

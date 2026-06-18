@@ -148,7 +148,7 @@ class DenseNetSimpleTests(unittest.TestCase):
         self.assertGreaterEqual(threshold, 0.55)
         self.assertLessEqual(threshold, 0.75)
 
-    def test_derive_threshold_priors_matches_label_prevalence(self) -> None:
+    def test_threshold_priors_use_label_priors_with_dynamic_infiltration(self) -> None:
         y_true = np.array(
             [
                 [1, 0],
@@ -166,9 +166,15 @@ class DenseNetSimpleTests(unittest.TestCase):
             ]
         )
 
-        thresholds = train_module.derive_threshold_priors(y_true, y_prob, ["A", "B"], default_threshold=0.5)
+        thresholds = train_module.threshold_priors(
+            y_true,
+            y_prob,
+            ["Infiltration", "Nodule"],
+            default_threshold=0.5,
+        )
 
-        self.assertEqual(thresholds, {"A": 0.7, "B": 0.8})
+        self.assertEqual(thresholds["Infiltration"], 0.7)
+        self.assertEqual(thresholds["Nodule"], train_module.LABEL_THRESHOLD_PRIORS["Nodule"])
 
     def test_score_for_checkpoint_prefers_disease_only_macro_average_precision(self) -> None:
         metrics = {
