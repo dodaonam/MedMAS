@@ -133,12 +133,37 @@ class DenseNetSimpleTests(unittest.TestCase):
 
         self.assertEqual(thresholds, {"A": 0.65, "B": 0.55})
 
+    def test_tune_binary_threshold_stays_within_radius_of_prior(self) -> None:
+        y_true = np.array([1, 1, 1, 0, 0, 0])
+        y_prob = np.array([0.95, 0.9, 0.25, 0.24, 0.23, 0.22])
+
+        threshold = train_module.tune_binary_threshold(
+            y_true,
+            y_prob,
+            default_threshold=0.5,
+            prior_threshold=0.65,
+            fallback_threshold=0.65,
+        )
+
+        self.assertGreaterEqual(threshold, 0.55)
+        self.assertLessEqual(threshold, 0.75)
+
     def test_low_support_thresholds_use_repo_priors_for_target_labels(self) -> None:
         thresholds = train_module.low_support_thresholds(TARGET_LABELS, 0.5)
 
         self.assertEqual(thresholds["Nodule"], train_module.LOW_SUPPORT_THRESHOLD_PRIORS["Nodule"])
         self.assertEqual(thresholds["Mass"], train_module.LOW_SUPPORT_THRESHOLD_PRIORS["Mass"])
         self.assertEqual(thresholds["Infiltration"], train_module.LOW_SUPPORT_THRESHOLD_PRIORS["Infiltration"])
+
+    def test_score_for_checkpoint_prefers_disease_only_macro_average_precision(self) -> None:
+        metrics = {
+            "macro_average_precision": 0.6,
+            "disease_only": {"macro_average_precision": 0.3},
+        }
+
+        score = train_module._score_for_checkpoint(metrics, val_loss=1.0)
+
+        self.assertEqual(score, 0.3)
 
     def test_attach_slice_metrics_adds_disease_only_and_scope_splits(self) -> None:
         labels = TARGET_LABELS

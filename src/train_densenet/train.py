@@ -40,6 +40,7 @@ METADATA_COLUMNS = [
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 MIN_TUNED_THRESHOLD_POSITIVES = 50
+THRESHOLD_PRIOR_SEARCH_RADIUS = 0.10
 LOW_SUPPORT_THRESHOLD_PRIORS = {
     "No Finding": 0.3478098213672638,
     "Infiltration": 0.4969785213470459,
@@ -982,6 +983,7 @@ def tune_thresholds(
             true[:, index],
             prob[:, index],
             default_threshold=default_threshold,
+            prior_threshold=None if low_support_threshold is None else fallback_thresholds[label],
             fallback_threshold=fallback_thresholds[label],
             min_positives_for_tuning=min_positives_for_tuning,
         )
@@ -994,6 +996,7 @@ def tune_binary_threshold(
     y_prob: Any,
     *,
     default_threshold: float = 0.5,
+    prior_threshold: float | None = None,
     fallback_threshold: float | None = None,
     min_positives_for_tuning: int = 0,
 ) -> float:
@@ -1001,8 +1004,9 @@ def tune_binary_threshold(
     prob = np.asarray(y_prob, dtype=float)
     positives = int(np.sum(true == 1))
     negatives = int(np.sum(true == 0))
+    anchor_threshold = float(default_threshold if prior_threshold is None else prior_threshold)
     if positives < min_positives_for_tuning:
-        return float(default_threshold if fallback_threshold is None else fallback_threshold)
+        return float(anchor_threshold if fallback_threshold is None else fallback_threshold)
     if positives == 0 or negatives == 0:
         return float(default_threshold)
 
@@ -1012,7 +1016,12 @@ def tune_binary_threshold(
     tp = 0
     fp = 0
     best_f1 = -1.0
-    best_threshold = float(default_threshold)
+    best_threshold = float(anchor_threshold)
+    lower_bound = None
+    upper_bound = None
+    if prior_threshold is not None:
+        lower_bound = max(0.0, anchor_threshold - THRESHOLD_PRIOR_SEARCH_RADIUS)
+        upper_bound = min(1.0, anchor_threshold + THRESHOLD_PRIOR_SEARCH_RADIUS)
     index = 0
     while index < len(sorted_prob):
         threshold = float(sorted_prob[index])
@@ -1022,6 +1031,8 @@ def tune_binary_threshold(
             else:
                 fp += 1
             index += 1
+        if lower_bound is not None and upper_bound is not None and (threshold < lower_bound or threshold > upper_bound):
+            continue
         fn = positives - tp
         precision = tp / (tp + fp) if tp + fp else 0.0
         recall = tp / (tp + fn) if tp + fn else 0.0
@@ -1032,8 +1043,8 @@ def tune_binary_threshold(
             continue
         if abs(f1 - best_f1) > 1e-12:
             continue
-        current_distance = abs(best_threshold - default_threshold)
-        candidate_distance = abs(threshold - default_threshold)
+        current_distance = abs(best_threshold - anchor_threshold)
+        candidate_distance = abs(threshold - anchor_threshold)
         if candidate_distance < current_distance or (
             candidate_distance == current_distance and threshold > best_threshold
         ):
@@ -1058,6 +1069,11 @@ def resolve_device(device: str | None = None) -> Any:
 
 
 def _score_for_checkpoint(metrics: dict[str, Any], val_loss: float) -> float:
+    disease_only = metrics.get("disease_only")
+    if isinstance(disease_only, Mapping):
+        disease_macro_ap = disease_only.get("macro_average_precision")
+        if disease_macro_ap is not None:
+            return float(disease_macro_ap)
     macro_ap = metrics.get("macro_average_precision")
     if macro_ap is not None:
         return float(macro_ap)
