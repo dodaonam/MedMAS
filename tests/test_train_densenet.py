@@ -148,12 +148,27 @@ class DenseNetSimpleTests(unittest.TestCase):
         self.assertGreaterEqual(threshold, 0.55)
         self.assertLessEqual(threshold, 0.75)
 
-    def test_low_support_thresholds_use_repo_priors_for_target_labels(self) -> None:
-        thresholds = train_module.low_support_thresholds(TARGET_LABELS, 0.5)
+    def test_derive_threshold_priors_matches_label_prevalence(self) -> None:
+        y_true = np.array(
+            [
+                [1, 0],
+                [1, 1],
+                [0, 0],
+                [0, 0],
+            ]
+        )
+        y_prob = np.array(
+            [
+                [0.9, 0.8],
+                [0.7, 0.6],
+                [0.4, 0.3],
+                [0.2, 0.1],
+            ]
+        )
 
-        self.assertEqual(thresholds["Nodule"], train_module.LOW_SUPPORT_THRESHOLD_PRIORS["Nodule"])
-        self.assertEqual(thresholds["Mass"], train_module.LOW_SUPPORT_THRESHOLD_PRIORS["Mass"])
-        self.assertEqual(thresholds["Infiltration"], train_module.LOW_SUPPORT_THRESHOLD_PRIORS["Infiltration"])
+        thresholds = train_module.derive_threshold_priors(y_true, y_prob, ["A", "B"], default_threshold=0.5)
+
+        self.assertEqual(thresholds, {"A": 0.7, "B": 0.8})
 
     def test_score_for_checkpoint_prefers_disease_only_macro_average_precision(self) -> None:
         metrics = {
