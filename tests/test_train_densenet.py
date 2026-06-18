@@ -118,6 +118,28 @@ class DenseNetSimpleTests(unittest.TestCase):
 
         self.assertEqual(thresholds, {"A": 0.5, "B": 0.5})
 
+    def test_tune_thresholds_support_low_uses_label_specific_fallbacks(self) -> None:
+        y_true = np.array([[1, 0], [1, 1], [0, 1], [0, 0]])
+        y_prob = np.array([[0.9, 0.3], [0.8, 0.8], [0.7, 0.4], [0.1, 0.1]])
+
+        thresholds = train_module.tune_thresholds(
+            y_true,
+            y_prob,
+            ["A", "B"],
+            default_threshold=0.5,
+            low_support_threshold={"A": 0.65, "B": 0.55},
+            min_positives_for_tuning=3,
+        )
+
+        self.assertEqual(thresholds, {"A": 0.65, "B": 0.55})
+
+    def test_low_support_thresholds_use_repo_priors_for_target_labels(self) -> None:
+        thresholds = train_module.low_support_thresholds(TARGET_LABELS, 0.5)
+
+        self.assertEqual(thresholds["Nodule"], train_module.LOW_SUPPORT_THRESHOLD_PRIORS["Nodule"])
+        self.assertEqual(thresholds["Mass"], train_module.LOW_SUPPORT_THRESHOLD_PRIORS["Mass"])
+        self.assertEqual(thresholds["Infiltration"], train_module.LOW_SUPPORT_THRESHOLD_PRIORS["Infiltration"])
+
     def test_attach_slice_metrics_adds_disease_only_and_scope_splits(self) -> None:
         labels = TARGET_LABELS
         y_true = np.array(

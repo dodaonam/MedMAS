@@ -40,6 +40,14 @@ METADATA_COLUMNS = [
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 MIN_TUNED_THRESHOLD_POSITIVES = 50
+LOW_SUPPORT_THRESHOLD_PRIORS = {
+    "No Finding": 0.3478098213672638,
+    "Infiltration": 0.4969785213470459,
+    "Effusion": 0.6419525742530823,
+    "Atelectasis": 0.43598130345344543,
+    "Nodule": 0.6589330434799194,
+    "Mass": 0.5078732967376709,
+}
 
 
 @dataclass
@@ -345,6 +353,7 @@ def train_model(config: TrainConfig) -> dict[str, Any]:
             y_prob,
             labels,
             default_threshold=config.threshold,
+            low_support_threshold=low_support_thresholds(labels, config.threshold),
             min_positives_for_tuning=MIN_TUNED_THRESHOLD_POSITIVES,
         )
         tuned_val_frame = prediction_frame(
@@ -411,6 +420,7 @@ def train_model(config: TrainConfig) -> dict[str, Any]:
         val_prob,
         labels,
         default_threshold=config.threshold,
+        low_support_threshold=low_support_thresholds(labels, config.threshold),
         min_positives_for_tuning=MIN_TUNED_THRESHOLD_POSITIVES,
     )
     val_frame = prediction_frame(
@@ -509,6 +519,7 @@ def finalize_run(config: TrainConfig, run_dir: Path) -> dict[str, Any]:
         val_prob,
         labels,
         default_threshold=threshold,
+        low_support_threshold=low_support_thresholds(labels, threshold),
         min_positives_for_tuning=MIN_TUNED_THRESHOLD_POSITIVES,
     )
     val_frame = prediction_frame(
@@ -927,6 +938,16 @@ def resolve_thresholds(labels: list[str], threshold: float | Mapping[str, float]
     return {label: float(threshold) for label in labels}
 
 
+def low_support_thresholds(labels: list[str], threshold: float | Mapping[str, float]) -> dict[str, float]:
+    thresholds = resolve_thresholds(labels, threshold)
+    if isinstance(threshold, Mapping):
+        return thresholds
+    for label, prior in LOW_SUPPORT_THRESHOLD_PRIORS.items():
+        if label in thresholds:
+            thresholds[label] = float(prior)
+    return thresholds
+
+
 def shared_threshold(thresholds: Mapping[str, float]) -> float | None:
     values = [float(value) for value in thresholds.values()]
     if not values:
@@ -943,6 +964,7 @@ def tune_thresholds(
     labels: list[str],
     *,
     default_threshold: float = 0.5,
+    low_support_threshold: float | Mapping[str, float] | None = None,
     min_positives_for_tuning: int = 0,
 ) -> dict[str, float]:
     true = np.asarray(y_true, dtype=int)
@@ -951,11 +973,16 @@ def tune_thresholds(
         raise ValueError(f"Shape mismatch: y_true {true.shape}, y_prob {prob.shape}")
     if true.ndim != 2 or true.shape[1] != len(labels):
         raise ValueError(f"Expected shape [n, {len(labels)}], got {true.shape}")
+    fallback_thresholds = resolve_thresholds(
+        labels,
+        default_threshold if low_support_threshold is None else low_support_threshold,
+    )
     return {
         label: tune_binary_threshold(
             true[:, index],
             prob[:, index],
             default_threshold=default_threshold,
+            fallback_threshold=fallback_thresholds[label],
             min_positives_for_tuning=min_positives_for_tuning,
         )
         for index, label in enumerate(labels)
@@ -967,6 +994,7 @@ def tune_binary_threshold(
     y_prob: Any,
     *,
     default_threshold: float = 0.5,
+    fallback_threshold: float | None = None,
     min_positives_for_tuning: int = 0,
 ) -> float:
     true = np.asarray(y_true, dtype=int)
@@ -974,7 +1002,7 @@ def tune_binary_threshold(
     positives = int(np.sum(true == 1))
     negatives = int(np.sum(true == 0))
     if positives < min_positives_for_tuning:
-        return float(default_threshold)
+        return float(default_threshold if fallback_threshold is None else fallback_threshold)
     if positives == 0 or negatives == 0:
         return float(default_threshold)
 
