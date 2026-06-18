@@ -39,6 +39,7 @@ METADATA_COLUMNS = [
 ]
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
+MIN_TUNED_THRESHOLD_POSITIVES = 50
 
 
 @dataclass
@@ -305,7 +306,8 @@ def train_model(config: TrainConfig) -> dict[str, Any]:
         "model_name": MODEL_NAME,
         "lr_scheduler": _scheduler_name(config),
         "cosine_t_max": _cosine_t_max(config),
-        "threshold_strategy": "per_label_f1_from_val",
+        "threshold_strategy": _threshold_strategy_name(),
+        "threshold_tuning_min_positives": MIN_TUNED_THRESHOLD_POSITIVES,
         "target_labels": labels,
         "threshold": config.threshold,
         "best_checkpoint": str(paths.checkpoint_path),
@@ -338,20 +340,27 @@ def train_model(config: TrainConfig) -> dict[str, Any]:
             run_id=run_id,
             desc=f"epoch {epoch}/{config.epochs} val",
         )
-        val_thresholds = tune_thresholds(y_true, y_prob, labels, default_threshold=config.threshold)
+        val_thresholds = tune_thresholds(
+            y_true,
+            y_prob,
+            labels,
+            default_threshold=config.threshold,
+            min_positives_for_tuning=MIN_TUNED_THRESHOLD_POSITIVES,
+        )
+        tuned_val_frame = prediction_frame(
+            metadata_rows_from_prediction_frame(val_frame),
+            y_true,
+            y_prob,
+            labels,
+            threshold=val_thresholds,
+            run_id=run_id,
+        )
         val_metrics = compute_metrics(y_true, y_prob, labels, threshold=val_thresholds, run_id=run_id)
+        val_metrics = attach_slice_metrics(val_metrics, tuned_val_frame, labels, threshold=val_thresholds)
         score = _score_for_checkpoint(val_metrics, val_loss)
         if score > best_score:
             best_score = score
             best_epoch = epoch
-            tuned_val_frame = prediction_frame(
-                metadata_rows_from_prediction_frame(val_frame),
-                y_true,
-                y_prob,
-                labels,
-                threshold=val_thresholds,
-                run_id=run_id,
-            )
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
@@ -397,7 +406,13 @@ def train_model(config: TrainConfig) -> dict[str, Any]:
         run_id=run_id,
         desc="best val",
     )
-    tuned_thresholds = tune_thresholds(val_true, val_prob, labels, default_threshold=config.threshold)
+    tuned_thresholds = tune_thresholds(
+        val_true,
+        val_prob,
+        labels,
+        default_threshold=config.threshold,
+        min_positives_for_tuning=MIN_TUNED_THRESHOLD_POSITIVES,
+    )
     val_frame = prediction_frame(
         metadata_rows_from_prediction_frame(val_frame),
         val_true,
@@ -426,9 +441,12 @@ def train_model(config: TrainConfig) -> dict[str, Any]:
     )
     val_metrics = compute_metrics(val_true, val_prob, labels, threshold=tuned_thresholds, run_id=run_id)
     test_metrics = compute_metrics(test_true, test_prob, labels, threshold=tuned_thresholds, run_id=run_id)
+    val_metrics = attach_slice_metrics(val_metrics, val_frame, labels, threshold=tuned_thresholds)
+    test_metrics = attach_slice_metrics(test_metrics, test_frame, labels, threshold=tuned_thresholds)
     val_metrics["loss"] = val_loss
     test_metrics["loss"] = test_loss
     config_payload["selected_thresholds"] = tuned_thresholds
+    config_payload["threshold_tuning_min_positives"] = MIN_TUNED_THRESHOLD_POSITIVES
     save_json(paths.config_path, config_payload)
 
     val_frame.to_csv(paths.predictions_val_path, index=False)
@@ -486,7 +504,13 @@ def finalize_run(config: TrainConfig, run_dir: Path) -> dict[str, Any]:
         run_id=run_id,
         desc="best val",
     )
-    tuned_thresholds = tune_thresholds(val_true, val_prob, labels, default_threshold=threshold)
+    tuned_thresholds = tune_thresholds(
+        val_true,
+        val_prob,
+        labels,
+        default_threshold=threshold,
+        min_positives_for_tuning=MIN_TUNED_THRESHOLD_POSITIVES,
+    )
     val_frame = prediction_frame(
         metadata_rows_from_prediction_frame(val_frame),
         val_true,
@@ -515,10 +539,13 @@ def finalize_run(config: TrainConfig, run_dir: Path) -> dict[str, Any]:
     )
     val_metrics = compute_metrics(val_true, val_prob, labels, threshold=tuned_thresholds, run_id=run_id)
     test_metrics = compute_metrics(test_true, test_prob, labels, threshold=tuned_thresholds, run_id=run_id)
+    val_metrics = attach_slice_metrics(val_metrics, val_frame, labels, threshold=tuned_thresholds)
+    test_metrics = attach_slice_metrics(test_metrics, test_frame, labels, threshold=tuned_thresholds)
     val_metrics["loss"] = val_loss
     test_metrics["loss"] = test_loss
     run_config["selected_thresholds"] = tuned_thresholds
-    run_config["threshold_strategy"] = "per_label_f1_from_val"
+    run_config["threshold_strategy"] = _threshold_strategy_name()
+    run_config["threshold_tuning_min_positives"] = MIN_TUNED_THRESHOLD_POSITIVES
     save_json(paths.config_path, run_config)
     val_frame.to_csv(paths.predictions_val_path, index=False)
     test_frame.to_csv(paths.predictions_test_path, index=False)
@@ -777,6 +804,67 @@ def compute_metrics(
     }
 
 
+def attach_slice_metrics(
+    metrics: dict[str, Any],
+    frame: pd.DataFrame,
+    labels: list[str],
+    *,
+    threshold: float | Mapping[str, float],
+) -> dict[str, Any]:
+    payload = dict(metrics)
+    thresholds = resolve_thresholds(labels, threshold)
+    disease_labels = [label for label in labels if label != "No Finding"]
+    if disease_labels:
+        disease_thresholds = {label: thresholds[label] for label in disease_labels}
+        disease_true, disease_prob = frame_targets_and_probabilities(frame, disease_labels)
+        disease_metrics = compute_metrics(
+            disease_true,
+            disease_prob,
+            disease_labels,
+            threshold=disease_thresholds,
+            run_id=metrics.get("run_id"),
+        )
+        payload["disease_only"] = {
+            "labels": disease_labels,
+            "macro_precision": disease_metrics["macro_precision"],
+            "macro_recall": disease_metrics["macro_recall"],
+            "macro_f1": disease_metrics["macro_f1"],
+            "macro_average_precision": disease_metrics["macro_average_precision"],
+            "macro_auroc": disease_metrics["macro_auroc"],
+            "micro": disease_metrics["micro"],
+        }
+
+    subsets: dict[str, Any] = {}
+    if "has_out_of_scope_label" in frame.columns:
+        for subset_name, subset_frame in [
+            ("in_scope_only", frame.loc[~frame["has_out_of_scope_label"].astype(bool)].copy()),
+            ("out_of_scope_only", frame.loc[frame["has_out_of_scope_label"].astype(bool)].copy()),
+        ]:
+            if subset_frame.empty:
+                continue
+            subset_true, subset_prob = frame_targets_and_probabilities(subset_frame, labels)
+            subset_metrics = compute_metrics(
+                subset_true,
+                subset_prob,
+                labels,
+                threshold=thresholds,
+                run_id=metrics.get("run_id"),
+            )
+            subsets[subset_name] = {
+                "row_count": int(len(subset_frame)),
+                "metrics": subset_metrics,
+            }
+    if subsets:
+        payload["subsets"] = subsets
+    return payload
+
+
+def frame_targets_and_probabilities(frame: pd.DataFrame, labels: list[str]) -> tuple[np.ndarray, np.ndarray]:
+    true = np.stack([frame[f"true_{label_slug(label)}"].to_numpy(dtype=int) for label in labels], axis=1)
+    prob = np.stack([frame[f"prob_{label_slug(label)}"].to_numpy(dtype=float) for label in labels], axis=1)
+    return true, prob
+
+
 def confusion_counts(y_true: Any, y_pred: Any) -> dict[str, int]:
     true = np.asarray(y_true, dtype=int)
     pred = np.asarray(y_pred, dtype=int)
@@ -855,6 +943,7 @@ def tune_thresholds(
     labels: list[str],
     *,
     default_threshold: float = 0.5,
+    min_positives_for_tuning: int = 0,
 ) -> dict[str, float]:
     true = np.asarray(y_true, dtype=int)
     prob = np.asarray(y_prob, dtype=float)
@@ -863,16 +952,29 @@ def tune_thresholds(
     if true.ndim != 2 or true.shape[1] != len(labels):
         raise ValueError(f"Expected shape [n, {len(labels)}], got {true.shape}")
     return {
-        label: tune_binary_threshold(true[:, index], prob[:, index], default_threshold=default_threshold)
+        label: tune_binary_threshold(
+            true[:, index],
+            prob[:, index],
+            default_threshold=default_threshold,
+            min_positives_for_tuning=min_positives_for_tuning,
+        )
         for index, label in enumerate(labels)
     }
 
 
-def tune_binary_threshold(y_true: Any, y_prob: Any, *, default_threshold: float = 0.5) -> float:
+def tune_binary_threshold(
+    y_true: Any,
+    y_prob: Any,
+    *,
+    default_threshold: float = 0.5,
+    min_positives_for_tuning: int = 0,
+) -> float:
     true = np.asarray(y_true, dtype=int)
     prob = np.asarray(y_prob, dtype=float)
     positives = int(np.sum(true == 1))
     negatives = int(np.sum(true == 0))
+    if positives < min_positives_for_tuning:
+        return float(default_threshold)
     if positives == 0 or negatives == 0:
         return float(default_threshold)
 
@@ -936,6 +1038,12 @@ def _score_for_checkpoint(metrics: dict[str, Any], val_loss: float) -> float:
 
 def _scheduler_name(config: TrainConfig) -> str:
     return "linear_warmup_cosine_annealing" if config.warmup_epochs > 0 else "cosine_annealing"
+
+
+def _threshold_strategy_name() -> str:
+    if MIN_TUNED_THRESHOLD_POSITIVES <= 0:
+        return "per_label_f1_from_val"
+    return f"per_label_f1_from_val_min_positives_{MIN_TUNED_THRESHOLD_POSITIVES}"
 
 
 def _cosine_t_max(config: TrainConfig) -> int:

@@ -104,6 +104,55 @@ class DenseNetSimpleTests(unittest.TestCase):
         self.assertEqual(metrics["per_label"]["B"]["threshold"], 0.4)
         self.assertEqual(metrics["macro_f1"], 1.0)
 
+    def test_tune_thresholds_falls_back_to_default_when_support_is_too_low(self) -> None:
+        y_true = np.array([[1, 0], [1, 1], [0, 1], [0, 0]])
+        y_prob = np.array([[0.9, 0.3], [0.8, 0.8], [0.7, 0.4], [0.1, 0.1]])
+
+        thresholds = train_module.tune_thresholds(
+            y_true,
+            y_prob,
+            ["A", "B"],
+            default_threshold=0.5,
+            min_positives_for_tuning=3,
+        )
+
+        self.assertEqual(thresholds, {"A": 0.5, "B": 0.5})
+
+    def test_attach_slice_metrics_adds_disease_only_and_scope_splits(self) -> None:
+        labels = TARGET_LABELS
+        y_true = np.array(
+            [
+                [1, 0, 0, 0, 0, 0],
+                [0, 1, 1, 0, 1, 0],
+                [0, 0, 0, 1, 0, 1],
+                [1, 0, 0, 0, 0, 0],
+            ]
+        )
+        y_prob = np.array(
+            [
+                [0.9, 0.1, 0.2, 0.1, 0.1, 0.1],
+                [0.2, 0.8, 0.7, 0.3, 0.9, 0.2],
+                [0.1, 0.2, 0.1, 0.8, 0.2, 0.8],
+                [0.8, 0.2, 0.1, 0.1, 0.1, 0.1],
+            ]
+        )
+        metadata_rows = [
+            {"Image Index": "a", "has_out_of_scope_label": False},
+            {"Image Index": "b", "has_out_of_scope_label": True},
+            {"Image Index": "c", "has_out_of_scope_label": False},
+            {"Image Index": "d", "has_out_of_scope_label": False},
+        ]
+        thresholds = {label: 0.5 for label in labels}
+
+        frame = train_module.prediction_frame(metadata_rows, y_true, y_prob, labels, threshold=thresholds, run_id="unit")
+        metrics = compute_metrics(y_true, y_prob, labels, threshold=thresholds, run_id="unit")
+        enriched = train_module.attach_slice_metrics(metrics, frame, labels, threshold=thresholds)
+
+        self.assertEqual(enriched["disease_only"]["labels"], labels[1:])
+        self.assertEqual(enriched["subsets"]["in_scope_only"]["row_count"], 3)
+        self.assertEqual(enriched["subsets"]["out_of_scope_only"]["row_count"], 1)
+        self.assertEqual(enriched["subsets"]["out_of_scope_only"]["metrics"]["per_label"]["No Finding"]["positive_count"], 0)
+
     def test_checkpoint_load_allows_script_metadata(self) -> None:
         calls = []
 
