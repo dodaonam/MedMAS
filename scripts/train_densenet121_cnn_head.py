@@ -24,6 +24,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup-epochs", type=int, default=2)
     parser.add_argument("--warmup-start-factor", type=float, default=0.1)
     parser.add_argument("--min-lr", type=float, default=1e-6)
+    parser.add_argument("--no-balanced-sampler", action="store_true", help="Disable rare-label balanced sampling.")
     parser.add_argument(
         "--threshold",
         type=float,
@@ -60,6 +61,7 @@ def main(argv: list[str] | None = None) -> int:
         warmup_start_factor=args.warmup_start_factor,
         min_lr=args.min_lr,
         threshold=args.threshold,
+        balanced_sampler=not args.no_balanced_sampler,
         pretrained=not args.no_pretrained,
         device=args.device,
     )

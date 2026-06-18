@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import sys
 import tempfile
 import unittest
@@ -134,6 +135,67 @@ class DenseNetSimpleTests(unittest.TestCase):
         self.assertEqual(payload["warmup_epochs"], 2)
         self.assertEqual(payload["warmup_start_factor"], 0.1)
         self.assertEqual(payload["min_lr"], 1e-6)
+        self.assertEqual(payload["balanced_sampler"], True)
+
+    @unittest.skipIf(train_module.torch is None, "torch not installed")
+    def test_balanced_sample_weights_prioritize_rare_positive_labels(self) -> None:
+        rows = []
+        for index in range(6):
+            row = {
+                "split": "train",
+                "No Finding": 1 if index < 4 else 0,
+                "Infiltration": 0,
+                "Effusion": 0,
+                "Atelectasis": 0,
+                "Nodule": 1 if index == 4 else 0,
+                "Mass": 1 if index == 5 else 0,
+            }
+            rows.append(row)
+        frame = pd.DataFrame(rows)
+
+        weights = train_module.balanced_sample_weights(frame, TARGET_LABELS).numpy()
+
+        self.assertLess(weights[0], weights[4])
+        self.assertLess(weights[0], weights[5])
+
+        all_common = frame.copy()
+        all_common["No Finding"] = 1
+        all_common[["Nodule", "Mass"]] = 0
+        self.assertTrue(np.all(train_module.balanced_sample_weights(all_common, TARGET_LABELS).numpy() > 0))
+
+    @unittest.skipIf(
+        train_module.torch is None or importlib.util.find_spec("torchvision") is None,
+        "torch or torchvision not installed",
+    )
+    def test_build_dataloaders_uses_balanced_sampler_when_enabled(self) -> None:
+        rows = []
+        for split in ["train", "train", "val", "test"]:
+            row = {
+                "split": split,
+                "image_path": "unused.png",
+                "No Finding": 1,
+                "Infiltration": 0,
+                "Effusion": 0,
+                "Atelectasis": 0,
+                "Nodule": 0,
+                "Mass": 0,
+            }
+            rows.append(row)
+        frame = pd.DataFrame(rows)
+        config = TrainConfig(
+            root=Path("/tmp/root"),
+            manifest_path=Path("/tmp/manifest.csv"),
+            target_labels_path=Path("/tmp/labels.json"),
+            output_dir=Path("/tmp/output"),
+            batch_size=2,
+            num_workers=0,
+        )
+
+        train_loader, val_loader, test_loader = train_module.build_dataloaders(config, frame, TARGET_LABELS)
+
+        self.assertEqual(train_loader.sampler.__class__.__name__, "WeightedRandomSampler")
+        self.assertNotEqual(val_loader.sampler.__class__.__name__, "WeightedRandomSampler")
+        self.assertNotEqual(test_loader.sampler.__class__.__name__, "WeightedRandomSampler")
 
     @unittest.skipIf(train_module.torch is None, "torch not installed")
     def test_build_lr_scheduler_warmup_then_cosine_uses_min_lr_in_last_epoch(self) -> None:

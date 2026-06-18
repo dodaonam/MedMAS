@@ -17,11 +17,12 @@ from tqdm.auto import tqdm
 
 try:
     import torch
-    from torch.utils.data import DataLoader, Dataset
+    from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 except ModuleNotFoundError:  # pragma: no cover - only happens before torch is installed
     torch = None  # type: ignore[assignment]
     DataLoader = None  # type: ignore[assignment]
     Dataset = object  # type: ignore[assignment,misc]
+    WeightedRandomSampler = None  # type: ignore[assignment]
 
 
 MODEL_NAME = "densenet121"
@@ -57,6 +58,7 @@ class TrainConfig:
     warmup_start_factor: float = 0.1
     min_lr: float = 1e-6
     threshold: float = 0.5
+    balanced_sampler: bool = True
     pretrained: bool = True
     device: str | None = None
 
@@ -217,6 +219,8 @@ def build_transforms(image_size: int) -> tuple[Any, Any]:
             transforms.Resize(resize_size),
             transforms.RandomResizedCrop(image_size, scale=(0.9, 1.0), ratio=(0.95, 1.05)),
             transforms.RandomRotation(5),
+            transforms.RandomAffine(degrees=0, translate=(0.03, 0.03), scale=(0.97, 1.03)),
+            transforms.ColorJitter(brightness=0.08, contrast=0.08),
             transforms.ToTensor(),
             transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
         ]
@@ -559,11 +563,16 @@ def build_dataloaders(config: TrainConfig, frame: pd.DataFrame, labels: list[str
         "test": ChestXrayDataset(frame, root=config.root, split="test", labels=labels, transform=eval_transform),
     }
     pin_memory = bool(torch.cuda.is_available())
+    train_sampler = None
+    if config.balanced_sampler:
+        train_weights = balanced_sample_weights(frame, labels)
+        train_sampler = WeightedRandomSampler(train_weights, num_samples=len(train_weights), replacement=True)
     return (
         DataLoader(
             datasets["train"],
             batch_size=config.batch_size,
-            shuffle=True,
+            shuffle=train_sampler is None,
+            sampler=train_sampler,
             num_workers=config.num_workers,
             pin_memory=pin_memory,
         ),
@@ -701,6 +710,20 @@ def positive_weights(frame: pd.DataFrame, labels: list[str]) -> Any:
     negatives = train.shape[0] - positives
     weights = negatives / np.maximum(positives, 1.0)
     return torch.tensor(weights, dtype=torch.float32)
+
+
+def balanced_sample_weights(frame: pd.DataFrame, labels: list[str]) -> Any:
+    _require_torch()
+    train = frame.loc[frame["split"].astype(str) == "train", labels].to_numpy(dtype=np.float32)
+    positives = train.sum(axis=0)
+    negatives = train.shape[0] - positives
+    label_weights = np.maximum(negatives / np.maximum(positives, 1.0), 1.0)
+    sample_weights = np.ones(train.shape[0], dtype=np.float64)
+    positive_mask = train == 1
+    for index, row_mask in enumerate(positive_mask):
+        if np.any(row_mask):
+            sample_weights[index] = float(np.max(label_weights[row_mask]))
+    return torch.tensor(sample_weights, dtype=torch.double)
 
 
 def compute_metrics(
