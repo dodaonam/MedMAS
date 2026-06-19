@@ -5,6 +5,7 @@ import random
 import re
 import time
 from collections.abc import Mapping
+from copy import deepcopy
 from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from pathlib import Path
@@ -68,6 +69,12 @@ class TrainConfig:
     warmup_epochs: int = 2
     warmup_start_factor: float = 0.1
     min_lr: float = 1e-6
+    classifier_dropout: float = 0.2
+    loss_name: str = "asl"
+    asl_gamma_neg: float = 4.0
+    asl_gamma_pos: float = 1.0
+    asl_clip: float = 0.05
+    ema_decay: float = 0.999
     threshold: float = 0.5
     balanced_sampler: bool = True
     pretrained: bool = True
@@ -254,14 +261,78 @@ def denormalize_image_tensor(image_tensor: Any) -> Any:
     return (image_tensor * std + mean).clamp(0, 1)
 
 
-def build_model(num_labels: int, *, pretrained: bool = True) -> Any:
+def build_model(num_labels: int, *, pretrained: bool = True, classifier_dropout: float = 0.0) -> Any:
     _require_torch()
     from torchvision.models import DenseNet121_Weights, densenet121
 
     weights = DenseNet121_Weights.DEFAULT if pretrained else None
     model = densenet121(weights=weights)
-    model.classifier = torch.nn.Linear(model.classifier.in_features, num_labels)
+    in_features = model.classifier.in_features
+    if classifier_dropout > 0.0:
+        model.classifier = torch.nn.Sequential(
+            torch.nn.Dropout(p=classifier_dropout),
+            torch.nn.Linear(in_features, num_labels),
+        )
+    else:
+        model.classifier = torch.nn.Linear(in_features, num_labels)
     return model
+
+
+class AsymmetricLoss(torch.nn.Module):  # type: ignore[misc]
+    def __init__(self, *, gamma_neg: float = 4.0, gamma_pos: float = 1.0, clip: float = 0.05, eps: float = 1e-8) -> None:
+        super().__init__()
+        self.gamma_neg = float(gamma_neg)
+        self.gamma_pos = float(gamma_pos)
+        self.clip = float(clip)
+        self.eps = float(eps)
+
+    def forward(self, logits: Any, targets: Any) -> Any:
+        probs = torch.sigmoid(logits)
+        probs_neg = 1.0 - probs
+        if self.clip > 0.0:
+            probs_neg = (probs_neg + self.clip).clamp(max=1.0)
+
+        loss = targets * torch.log(probs.clamp(min=self.eps))
+        loss = loss + (1.0 - targets) * torch.log(probs_neg.clamp(min=self.eps))
+
+        if self.gamma_neg > 0.0 or self.gamma_pos > 0.0:
+            pt = targets * probs + (1.0 - targets) * probs_neg
+            gamma = targets * self.gamma_pos + (1.0 - targets) * self.gamma_neg
+            loss = loss * torch.pow(1.0 - pt, gamma)
+
+        return -loss.mean()
+
+
+class ExponentialMovingAverage:
+    def __init__(self, model: Any, *, decay: float) -> None:
+        self.decay = float(decay)
+        self.model = deepcopy(model).eval()
+        for parameter in self.model.parameters():
+            parameter.requires_grad_(False)
+
+    def update(self, model: Any) -> None:
+        with torch.no_grad():
+            ema_state = self.model.state_dict()
+            model_state = model.state_dict()
+            for key, value in ema_state.items():
+                source = model_state[key].detach()
+                if torch.is_floating_point(value) or torch.is_complex(value):
+                    value.copy_(value * self.decay + source * (1.0 - self.decay))
+                    continue
+                value.copy_(source)
+
+
+def build_criterion(config: TrainConfig, frame: pd.DataFrame, labels: list[str], device: Any) -> Any:
+    _require_torch()
+    if config.loss_name == "asl":
+        return AsymmetricLoss(
+            gamma_neg=config.asl_gamma_neg,
+            gamma_pos=config.asl_gamma_pos,
+            clip=config.asl_clip,
+        )
+    if config.loss_name == "bce":
+        return torch.nn.BCEWithLogitsLoss(pos_weight=positive_weights(frame, labels).to(device))
+    raise ValueError(f"Unsupported loss_name: {config.loss_name!r}")
 
 
 def build_lr_scheduler(optimizer: Any, config: TrainConfig) -> Any:
@@ -305,10 +376,15 @@ def train_model(config: TrainConfig) -> dict[str, Any]:
     paths.run_dir.mkdir(parents=True, exist_ok=False)
 
     train_loader, val_loader, test_loader = build_dataloaders(config, frame, labels)
-    model = build_model(len(labels), pretrained=config.pretrained).to(device)
-    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=positive_weights(frame, labels).to(device))
+    model = build_model(
+        len(labels),
+        pretrained=config.pretrained,
+        classifier_dropout=config.classifier_dropout,
+    ).to(device)
+    criterion = build_criterion(config, frame, labels, device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     scheduler = build_lr_scheduler(optimizer, config)
+    ema = ExponentialMovingAverage(model, decay=config.ema_decay) if config.ema_decay > 0.0 else None
 
     config_payload = {
         **_config_to_json(config),
@@ -338,10 +414,12 @@ def train_model(config: TrainConfig) -> dict[str, Any]:
             criterion,
             optimizer,
             device,
+            ema=ema,
             desc=f"epoch {epoch}/{config.epochs} train",
         )
+        eval_model = ema.model if ema is not None else model
         val_loss, val_frame, y_true, y_prob = predict(
-            model,
+            eval_model,
             val_loader,
             criterion,
             device,
@@ -375,6 +453,7 @@ def train_model(config: TrainConfig) -> dict[str, Any]:
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
+                    "ema_state_dict": ema.model.state_dict() if ema is not None else None,
                     "labels": labels,
                     "config": config_payload,
                     "epoch": epoch,
@@ -406,7 +485,8 @@ def train_model(config: TrainConfig) -> dict[str, Any]:
         scheduler.step()
 
     checkpoint = load_checkpoint(paths.checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
+    state_dict_key = "ema_state_dict" if checkpoint.get("ema_state_dict") is not None else "model_state_dict"
+    model.load_state_dict(checkpoint[state_dict_key])
     val_loss, val_frame, val_true, val_prob = predict(
         model,
         val_loader,
@@ -501,10 +581,22 @@ def finalize_run(config: TrainConfig, run_dir: Path) -> dict[str, Any]:
     )
     frame = load_manifest(eval_config.manifest_path, labels)
     _train_loader, val_loader, test_loader = build_dataloaders(eval_config, frame, labels)
-    model = build_model(len(labels), pretrained=False).to(device)
+    model = build_model(
+        len(labels),
+        pretrained=False,
+        classifier_dropout=float(run_config.get("classifier_dropout", 0.0)),
+    ).to(device)
     checkpoint = load_checkpoint(paths.checkpoint_path, map_location=device)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    criterion = torch.nn.BCEWithLogitsLoss(pos_weight=positive_weights(frame, labels).to(device))
+    state_dict_key = "ema_state_dict" if checkpoint.get("ema_state_dict") is not None else "model_state_dict"
+    model.load_state_dict(checkpoint[state_dict_key])
+    eval_config = replace(
+        eval_config,
+        loss_name=str(run_config.get("loss_name", config.loss_name)),
+        asl_gamma_neg=float(run_config.get("asl_gamma_neg", config.asl_gamma_neg)),
+        asl_gamma_pos=float(run_config.get("asl_gamma_pos", config.asl_gamma_pos)),
+        asl_clip=float(run_config.get("asl_clip", config.asl_clip)),
+    )
+    criterion = build_criterion(eval_config, frame, labels, device)
 
     val_loss, val_frame, val_true, val_prob = predict(
         model,
@@ -581,7 +673,11 @@ def smoke_check(config: TrainConfig) -> dict[str, Any]:
     frame = load_manifest(config.manifest_path, labels)
     train_loader, _, _ = build_dataloaders(config, frame, labels)
     device = resolve_device(config.device)
-    model = build_model(len(labels), pretrained=config.pretrained).to(device)
+    model = build_model(
+        len(labels),
+        pretrained=config.pretrained,
+        classifier_dropout=config.classifier_dropout,
+    ).to(device)
     images, targets, _metadata = next(iter(train_loader))
     model.eval()
     with torch.no_grad():
@@ -633,7 +729,16 @@ def build_dataloaders(config: TrainConfig, frame: pd.DataFrame, labels: list[str
     )
 
 
-def train_one_epoch(model: Any, loader: Any, criterion: Any, optimizer: Any, device: Any, *, desc: str = "train") -> float:
+def train_one_epoch(
+    model: Any,
+    loader: Any,
+    criterion: Any,
+    optimizer: Any,
+    device: Any,
+    *,
+    ema: ExponentialMovingAverage | None = None,
+    desc: str = "train",
+) -> float:
     model.train()
     total_loss = 0.0
     total_rows = 0
@@ -646,6 +751,8 @@ def train_one_epoch(model: Any, loader: Any, criterion: Any, optimizer: Any, dev
         loss = criterion(logits, targets)
         loss.backward()
         optimizer.step()
+        if ema is not None:
+            ema.update(model)
         batch_size = int(images.shape[0])
         total_loss += float(loss.detach().cpu()) * batch_size
         total_rows += batch_size

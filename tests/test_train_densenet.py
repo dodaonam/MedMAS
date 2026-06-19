@@ -341,6 +341,52 @@ class DenseNetSimpleTests(unittest.TestCase):
         self.assertAlmostEqual(used_lrs[2], 1e-4, places=12)
         self.assertAlmostEqual(used_lrs[-1], 1e-6, places=12)
 
+    @unittest.skipIf(train_module.torch is None, "torch not installed")
+    def test_asymmetric_loss_prefers_better_logits(self) -> None:
+        criterion = train_module.AsymmetricLoss()
+        targets = train_module.torch.tensor([[1.0, 0.0], [0.0, 1.0]])
+        better = train_module.torch.tensor([[3.0, -3.0], [-3.0, 3.0]])
+        worse = train_module.torch.tensor([[0.5, -0.5], [-0.5, 0.5]])
+
+        self.assertLess(float(criterion(better, targets)), float(criterion(worse, targets)))
+
+    @unittest.skipIf(train_module.torch is None, "torch not installed")
+    def test_exponential_moving_average_updates_parameters(self) -> None:
+        model = train_module.torch.nn.Linear(1, 1, bias=False)
+        with train_module.torch.no_grad():
+            model.weight.fill_(1.0)
+        ema = train_module.ExponentialMovingAverage(model, decay=0.5)
+        with train_module.torch.no_grad():
+            model.weight.fill_(3.0)
+
+        ema.update(model)
+
+        self.assertAlmostEqual(float(ema.model.weight.item()), 2.0, places=6)
+
+    @unittest.skipIf(train_module.torch is None, "torch not installed")
+    def test_exponential_moving_average_copies_non_floating_buffers(self) -> None:
+        model = train_module.torch.nn.BatchNorm1d(2)
+        ema = train_module.ExponentialMovingAverage(model, decay=0.5)
+        with train_module.torch.no_grad():
+            model.weight.fill_(3.0)
+            model.num_batches_tracked.fill_(7)
+
+        ema.update(model)
+
+        self.assertAlmostEqual(float(ema.model.weight.mean().item()), 2.0, places=6)
+        self.assertEqual(int(ema.model.num_batches_tracked.item()), 7)
+
+    @unittest.skipIf(
+        train_module.torch is None or importlib.util.find_spec("torchvision") is None,
+        "torch or torchvision not installed",
+    )
+    def test_build_model_uses_dropout_head_when_enabled(self) -> None:
+        model = train_module.build_model(2, pretrained=False, classifier_dropout=0.2)
+
+        self.assertEqual(model.classifier.__class__.__name__, "Sequential")
+        self.assertEqual(model.classifier[0].__class__.__name__, "Dropout")
+        self.assertEqual(model.classifier[1].__class__.__name__, "Linear")
+
 
 if __name__ == "__main__":
     unittest.main()
