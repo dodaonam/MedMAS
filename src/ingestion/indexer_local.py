@@ -13,7 +13,7 @@ from qdrant_client import QdrantClient, models
 load_dotenv()
 
 
-DEFAULT_COLLECTION_NAME = "medical_docs_bge_m3_hybrid"
+DEFAULT_COLLECTION_NAME = "medical_docs"
 DEFAULT_MODEL_NAME = "BAAI/bge-m3"
 DEFAULT_DENSE_VECTOR_NAME = "dense"
 DEFAULT_SPARSE_VECTOR_NAME = "sparse"
@@ -21,6 +21,7 @@ DEFAULT_DENSE_DIMENSION = 1024
 DEFAULT_BATCH_SIZE = 8
 DEFAULT_QUERY_MAX_LENGTH = 512
 DEFAULT_PASSAGE_MAX_LENGTH = 1024
+DEFAULT_QDRANT_TIMEOUT = 360
 
 
 class LocalBGEM3Embedder:
@@ -128,6 +129,7 @@ class QdrantBGEM3LocalIndexer:
         collection_name: str | None = None,
         qdrant_url: str | None = None,
         qdrant_api_key: str | None = None,
+        qdrant_timeout: int | None = None,
         dense_vector_name: str = DEFAULT_DENSE_VECTOR_NAME,
         sparse_vector_name: str = DEFAULT_SPARSE_VECTOR_NAME,
         embedder: LocalBGEM3Embedder | None = None,
@@ -138,6 +140,9 @@ class QdrantBGEM3LocalIndexer:
         )
         self.dense_vector_name = dense_vector_name
         self.sparse_vector_name = sparse_vector_name
+        self.qdrant_timeout = qdrant_timeout or _env_int(
+            "QDRANT_TIMEOUT", DEFAULT_QDRANT_TIMEOUT
+        )
 
         if client is None:
             resolved_url = qdrant_url or os.environ.get("QDRANT_URL")
@@ -148,6 +153,7 @@ class QdrantBGEM3LocalIndexer:
             client = QdrantClient(
                 url=resolved_url,
                 api_key=qdrant_api_key or os.environ.get("QDRANT_API_KEY"),
+                timeout=self.qdrant_timeout,
             )
         self.client = client
 
@@ -230,6 +236,7 @@ class QdrantBGEM3LocalIndexer:
                 collection_name=self.collection_name,
                 points=points,
                 wait=wait,
+                timeout=self.qdrant_timeout,
             )
             total += len(points)
 

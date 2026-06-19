@@ -74,6 +74,7 @@ class LocalIndexerTests(unittest.TestCase):
         self.assertEqual(len(client.upserts), 1)
         upsert = client.upserts[0]
         self.assertEqual(upsert["collection_name"], "medical_docs")
+        self.assertEqual(upsert["timeout"], 180)
         point = upsert["points"][0]
         self.assertEqual(
             point.id,
@@ -132,12 +133,14 @@ class _FakeClient:
         collection_name: str,
         points: list[models.PointStruct],
         wait: bool,
+        timeout: int | None = None,
     ) -> bool:
         self.upserts.append(
             {
                 "collection_name": collection_name,
                 "points": points,
                 "wait": wait,
+                "timeout": timeout,
             }
         )
         return True
