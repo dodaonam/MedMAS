@@ -51,7 +51,7 @@ uv run python scripts/train_densenet121_cnn_head.py --dry-run-smoke
 uv run python scripts/train_densenet121_cnn_head.py
 ```
 
-For GPU training on the sample subset, keep the default lighter input first:
+For GPU training on the sample subset, the current recommended baseline is:
 
 ```bash
 uv run python scripts/train_densenet121_cnn_head.py \
@@ -59,20 +59,27 @@ uv run python scripts/train_densenet121_cnn_head.py \
   --target-labels-path artifacts/preprocess/target_labels.json \
   --output-dir artifacts/training/densenet121 \
   --seed 0 \
-  --epochs 20 \
+  --epochs 10 \
   --batch-size 32 \
   --num-workers 4 \
-  --image-size 224 \
+  --image-size 320 \
   --lr 1e-4 \
   --weight-decay 1e-4 \
-  --warmup-epochs 2 \
+  --warmup-epochs 1 \
   --warmup-start-factor 0.1 \
   --min-lr 1e-6 \
+  --classifier-dropout 0.2 \
+  --loss-name asl \
+  --asl-gamma-neg 4.0 \
+  --asl-gamma-pos 1.0 \
+  --asl-clip 0.05 \
+  --ema-decay 0.999 \
   --threshold 0.5 \
-  --device cuda
+  --device cuda \
+  --no-balanced-sampler
 ```
 
-The training CLI defaults to `20` epochs with `2` epochs of linear warmup followed by cosine learning-rate decay. Training uses rare-label balanced sampling by default and light X-ray-safe augmentation. Final validation and test exports tune one threshold per label on the validation split by maximizing per-label F1, and reuse those tuned thresholds for test predictions.
+The training CLI defaults to `20` epochs with `2` epochs of linear warmup followed by cosine learning-rate decay. Training uses rare-label balanced sampling by default, light X-ray-safe augmentation, an `Asymmetric Loss` objective, classifier-head dropout, and EMA weights for evaluation/checkpoint export. Final validation and test exports tune one threshold per label on the validation split by maximizing per-label F1, and reuse those tuned thresholds for test predictions.
 
 Training outputs are written under:
 

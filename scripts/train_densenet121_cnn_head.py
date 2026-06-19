@@ -24,6 +24,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup-epochs", type=int, default=2)
     parser.add_argument("--warmup-start-factor", type=float, default=0.1)
     parser.add_argument("--min-lr", type=float, default=1e-6)
+    parser.add_argument("--classifier-dropout", type=float, default=0.2)
+    parser.add_argument("--loss-name", choices=["asl", "bce"], default="asl")
+    parser.add_argument("--asl-gamma-neg", type=float, default=4.0)
+    parser.add_argument("--asl-gamma-pos", type=float, default=1.0)
+    parser.add_argument("--asl-clip", type=float, default=0.05)
+    parser.add_argument("--ema-decay", type=float, default=0.999)
     parser.add_argument("--no-balanced-sampler", action="store_true", help="Disable rare-label balanced sampling.")
     parser.add_argument(
         "--threshold",
@@ -60,6 +66,12 @@ def main(argv: list[str] | None = None) -> int:
         warmup_epochs=args.warmup_epochs,
         warmup_start_factor=args.warmup_start_factor,
         min_lr=args.min_lr,
+        classifier_dropout=args.classifier_dropout,
+        loss_name=args.loss_name,
+        asl_gamma_neg=args.asl_gamma_neg,
+        asl_gamma_pos=args.asl_gamma_pos,
+        asl_clip=args.asl_clip,
+        ema_decay=args.ema_decay,
         threshold=args.threshold,
         balanced_sampler=not args.no_balanced_sampler,
         pretrained=not args.no_pretrained,
