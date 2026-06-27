@@ -4,6 +4,7 @@ import json
 import importlib.util
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -28,7 +29,29 @@ from train_densenet import (
     resolve_run_dir,
     save_json,
 )
-import train_densenet.train as train_module
+from train_densenet import _backend as backend_module
+from train_densenet import config as config_module
+from train_densenet import data as data_module
+from train_densenet import evaluation as evaluation_module
+from train_densenet import modeling as modeling_module
+from train_densenet import pipeline as pipeline_module
+
+train_module = types.SimpleNamespace()
+for module in (
+    backend_module,
+    config_module,
+    data_module,
+    evaluation_module,
+    modeling_module,
+    pipeline_module,
+):
+    for name in dir(module):
+        if not name.startswith("__"):
+            setattr(train_module, name, getattr(module, name))
+
+train_module._config_to_json = config_module.config_to_json
+train_module._score_for_checkpoint = evaluation_module.checkpoint_score
+train_module._techniques_payload = pipeline_module.techniques_payload
 
 
 class DenseNetSimpleTests(unittest.TestCase):
@@ -221,6 +244,89 @@ class DenseNetSimpleTests(unittest.TestCase):
         self.assertEqual(enriched["subsets"]["out_of_scope_only"]["row_count"], 1)
         self.assertEqual(enriched["subsets"]["out_of_scope_only"]["metrics"]["per_label"]["No Finding"]["positive_count"], 0)
 
+    def test_validate_train_config_rejects_invalid_freeze_schedule(self) -> None:
+        config = TrainConfig(
+            root=ROOT,
+            manifest_path=ROOT / "artifacts" / "preprocess" / "split_manifest.csv",
+            target_labels_path=ROOT / "artifacts" / "preprocess" / "target_labels.json",
+            output_dir=ROOT / "artifacts" / "training" / "densenet121",
+            epochs=2,
+            freeze_backbone_epochs=2,
+        )
+
+        with self.assertRaisesRegex(ValueError, "freeze_backbone_epochs"):
+            train_module.validate_train_config(config)
+
+    def test_validate_train_config_rejects_head_only_with_freeze_schedule(self) -> None:
+        config = TrainConfig(
+            root=ROOT,
+            manifest_path=ROOT / "artifacts" / "preprocess" / "split_manifest.csv",
+            target_labels_path=ROOT / "artifacts" / "preprocess" / "target_labels.json",
+            output_dir=ROOT / "artifacts" / "training" / "densenet121",
+            head_only=True,
+            freeze_backbone_epochs=1,
+        )
+
+        with self.assertRaisesRegex(ValueError, "head_only"):
+            train_module.validate_train_config(config)
+
+    @unittest.skipIf(train_module.torch is None, "PyTorch is not installed")
+    def test_set_backbone_trainable_freezes_features_only(self) -> None:
+        torch = train_module.torch
+        assert torch is not None
+        model = torch.nn.Module()
+        model.features = torch.nn.Sequential(torch.nn.Linear(4, 4), torch.nn.BatchNorm1d(4))
+        model.classifier = torch.nn.Linear(4, 2)
+
+        train_module.set_backbone_trainable(model, trainable=False)
+
+        self.assertTrue(all(not parameter.requires_grad for parameter in model.features.parameters()))
+        self.assertTrue(all(parameter.requires_grad for parameter in model.classifier.parameters()))
+
+        train_module.set_backbone_trainable(model, trainable=True)
+
+        self.assertTrue(all(parameter.requires_grad for parameter in model.features.parameters()))
+
+    @unittest.skipIf(train_module.torch is None, "PyTorch is not installed")
+    def test_train_one_epoch_keeps_frozen_backbone_in_eval_mode(self) -> None:
+        torch = train_module.torch
+        assert torch is not None
+
+        class TinyModel(torch.nn.Module):
+            def __init__(self) -> None:
+                super().__init__()
+                self.features = torch.nn.Sequential(torch.nn.BatchNorm1d(4), torch.nn.Linear(4, 4))
+                self.classifier = torch.nn.Linear(4, 1)
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                x = self.features(x)
+                return self.classifier(x)
+
+        model = TinyModel()
+        train_module.set_backbone_trainable(model, trainable=False)
+        criterion = torch.nn.BCEWithLogitsLoss()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.1)
+        loader = [
+            (
+                torch.randn(3, 4),
+                torch.randint(0, 2, (3, 1), dtype=torch.float32),
+                {},
+            )
+        ]
+
+        train_module.train_one_epoch(
+            model,
+            loader,
+            criterion,
+            optimizer,
+            torch.device("cpu"),
+            backbone_trainable=False,
+            desc="unit",
+        )
+
+        self.assertFalse(model.features.training)
+        self.assertTrue(model.classifier.training)
+
     def test_checkpoint_load_allows_script_metadata(self) -> None:
         calls = []
 
@@ -229,12 +335,12 @@ class DenseNetSimpleTests(unittest.TestCase):
                 calls.append((args, kwargs))
                 return {"model_state_dict": {}}
 
-        original_torch = train_module.torch
-        train_module.torch = FakeTorch()  # type: ignore[assignment]
+        original_torch = config_module.torch
+        config_module.torch = FakeTorch()  # type: ignore[assignment]
         try:
-            checkpoint = train_module.load_checkpoint(Path("checkpoint_best.pt"), map_location="cpu")
+            checkpoint = config_module.load_checkpoint(Path("checkpoint_best.pt"), map_location="cpu")
         finally:
-            train_module.torch = original_torch
+            config_module.torch = original_torch
 
         self.assertEqual(checkpoint, {"model_state_dict": {}})
         self.assertEqual(calls[0][1]["weights_only"], False)
@@ -253,6 +359,52 @@ class DenseNetSimpleTests(unittest.TestCase):
         self.assertEqual(payload["warmup_start_factor"], 0.1)
         self.assertEqual(payload["min_lr"], 1e-6)
         self.assertEqual(payload["balanced_sampler"], True)
+
+    def test_techniques_payload_records_training_choices(self) -> None:
+        config = TrainConfig(
+            root=Path("/tmp/root"),
+            manifest_path=Path("/tmp/manifest.csv"),
+            target_labels_path=Path("/tmp/labels.json"),
+            output_dir=Path("/tmp/output"),
+            classifier_dropout=0.25,
+            loss_name="asl",
+            ema_decay=0.99,
+            freeze_backbone_epochs=2,
+            image_size=320,
+        )
+
+        payload = train_module._techniques_payload(config, TARGET_LABELS)
+
+        self.assertIn("imagenet_pretrained_backbone", payload["applied_techniques"])
+        self.assertIn("classifier_only_warm_start", payload["applied_techniques"])
+        self.assertEqual(payload["model"]["classifier_head"]["type"], "dropout_linear")
+        self.assertEqual(payload["model"]["classifier_head"]["num_outputs"], len(TARGET_LABELS))
+        self.assertEqual(payload["data"]["sampling_strategy"], "weighted_random_sampler")
+        self.assertEqual(payload["data"]["transforms"]["train"]["random_resized_crop"]["size"], 320)
+        self.assertEqual(payload["optimization"]["backbone_training_strategy"]["name"], "classifier_only_then_full_finetune")
+        self.assertEqual(payload["optimization"]["loss"]["asymmetric_loss"]["gamma_neg"], 4.0)
+        self.assertEqual(
+            payload["evaluation"]["checkpoint_selection_metric"],
+            "disease_only_macro_average_precision_then_macro_average_precision_then_negative_val_loss",
+        )
+
+    def test_techniques_payload_records_head_only_strategy(self) -> None:
+        config = TrainConfig(
+            root=Path("/tmp/root"),
+            manifest_path=Path("/tmp/manifest.csv"),
+            target_labels_path=Path("/tmp/labels.json"),
+            output_dir=Path("/tmp/output"),
+            head_only=True,
+        )
+
+        payload = train_module._techniques_payload(config, TARGET_LABELS)
+
+        self.assertIn("head_only_training", payload["applied_techniques"])
+        self.assertEqual(
+            payload["optimization"]["backbone_training_strategy"]["name"],
+            "classifier_only_frozen_backbone",
+        )
+        self.assertTrue(payload["optimization"]["backbone_training_strategy"]["head_only"])
 
     @unittest.skipIf(train_module.torch is None, "torch not installed")
     def test_balanced_sample_weights_prioritize_rare_positive_labels(self) -> None:

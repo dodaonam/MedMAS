@@ -30,6 +30,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--asl-gamma-pos", type=float, default=1.0)
     parser.add_argument("--asl-clip", type=float, default=0.05)
     parser.add_argument("--ema-decay", type=float, default=0.999)
+    parser.add_argument(
+        "--head-only",
+        action="store_true",
+        help="Train only the classifier head for the whole run and keep the DenseNet backbone frozen.",
+    )
+    parser.add_argument(
+        "--freeze-backbone-epochs",
+        type=int,
+        default=0,
+        help="Freeze DenseNet backbone and train only the classifier for the first N epochs, then unfreeze.",
+    )
     parser.add_argument("--no-balanced-sampler", action="store_true", help="Disable rare-label balanced sampling.")
     parser.add_argument(
         "--threshold",
@@ -73,6 +84,8 @@ def main(argv: list[str] | None = None) -> int:
         asl_clip=args.asl_clip,
         ema_decay=args.ema_decay,
         threshold=args.threshold,
+        head_only=args.head_only,
+        freeze_backbone_epochs=args.freeze_backbone_epochs,
         balanced_sampler=not args.no_balanced_sampler,
         pretrained=not args.no_pretrained,
         device=args.device,
