@@ -12,7 +12,7 @@ from qdrant_client import models
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from ingestion.indexer_local import (
+from ingestion.indexer import (
     DEFAULT_DENSE_DIMENSION,
     DEFAULT_DENSE_VECTOR_NAME,
     DEFAULT_SPARSE_VECTOR_NAME,

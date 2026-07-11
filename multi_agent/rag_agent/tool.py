@@ -6,7 +6,6 @@ from collections import defaultdict
 
 import torch
 from FlagEmbedding import BGEM3FlagModel
-from langchain_cloudflare.embeddings import CloudflareWorkersAIEmbeddings
 from langchain_cohere import CohereRerank
 from langchain_core.documents import Document
 from langchain_core.runnables import RunnableLambda
@@ -20,7 +19,7 @@ TOP_RRF = 50
 TOP_K = 10
 RRF_K = 60
 LLM_MODEL = "gpt-5.4-mini"
-CF_EMBED_MODEL = "@cf/baai/bge-m3"
+EMBED_MODEL_NAME = "nqd-301125/bge-m3-medical-vi-dense"
 COHERE_MODEL = "rerank-multilingual-v3.0"
 COLLECTION = "medical_docs"
 
@@ -36,7 +35,7 @@ def get_sparse_model() -> BGEM3FlagModel:
             warnings.filterwarnings("ignore", category=UserWarning, module="torch")
             use_fp16 = torch.cuda.is_available()
         _sparse_model = BGEM3FlagModel(
-            "BAAI/bge-m3",
+            EMBED_MODEL_NAME,
             use_fp16=use_fp16,
             batch_size=64,
             query_max_length=512,
@@ -85,20 +84,20 @@ def get_qdrant_client() -> QdrantClient:
 
 # ── Dense embedder ────────────────────────────────────────────────────────────
 
-_dense_embedder: CloudflareWorkersAIEmbeddings | None = None
+_dense_embedder: BGEM3FlagModel | None = None
 
 
-def get_dense_embedder() -> CloudflareWorkersAIEmbeddings:
+def get_dense_embedder() -> BGEM3FlagModel:
     global _dense_embedder
     if _dense_embedder is None:
-        # Support both standard names (CF_ACCOUNT_ID / CF_AI_API_TOKEN) and
-        # legacy names used in the current .env (ACCOUNT_ID / CLOUDFLARE_AUTH_TOKEN)
-        account_id = os.environ.get("CF_ACCOUNT_ID") or os.environ.get("ACCOUNT_ID", "")
-        api_token = os.environ.get("CF_AI_API_TOKEN") or os.environ.get("CLOUDFLARE_AUTH_TOKEN", "")
-        _dense_embedder = CloudflareWorkersAIEmbeddings(
-            account_id=account_id,
-            api_token=api_token,
-            model_name=CF_EMBED_MODEL,
+        with warnings.catch_warnings():
+            warnings.filterwarnings("ignore", category=UserWarning, module="torch")
+            use_fp16 = torch.cuda.is_available()
+        _dense_embedder = BGEM3FlagModel(
+            EMBED_MODEL_NAME,
+            use_fp16=use_fp16,
+            batch_size=64,
+            query_max_length=512,
         )
     return _dense_embedder
 
@@ -107,7 +106,14 @@ def get_dense_embedder() -> CloudflareWorkersAIEmbeddings:
 
 def retrieve(search_queries: list[str]) -> list[list[Document]]:
     """Dense + sparse hybrid search. N Qdrant hybrid calls run in parallel via batch()."""
-    dense_vecs = get_dense_embedder().embed_documents(search_queries)
+    dense_vecs = get_dense_embedder().encode(
+        search_queries,
+        batch_size=64,
+        max_length=512,
+        return_dense=True,
+        return_sparse=False,
+        return_colbert_vecs=False,
+    )["dense_vecs"]
     sparse_vecs = encode_queries_sparse(search_queries)
     client = get_qdrant_client()
 

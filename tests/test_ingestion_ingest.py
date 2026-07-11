@@ -15,31 +15,6 @@ from ingestion.ingest import ingest_structured_jsonl
 
 
 class IngestionEntrypointTests(unittest.TestCase):
-    def test_ingest_structured_jsonl_uses_endpoint_backend(self) -> None:
-        documents = [
-            Document(
-                id="doc-1",
-                page_content="Ho sot va ho",
-                metadata={"url": "https://example.com/a", "title": "A"},
-            )
-        ]
-
-        with (
-            patch("ingestion.ingest.structured_jsonl_to_documents", return_value=documents),
-            patch("ingestion.ingest.index_documents_to_qdrant_cloud") as index_mock,
-        ):
-            index_mock.return_value.collection_name = "endpoint-collection"
-            summary = ingest_structured_jsonl(
-                input_path=Path("articles.jsonl"),
-                index_backend="endpoint",
-                collection_name="endpoint-collection",
-            )
-
-        index_mock.assert_called_once()
-        self.assertEqual(summary["index_backend"], "endpoint")
-        self.assertEqual(summary["collection_name"], "endpoint-collection")
-        self.assertEqual(summary["documents_indexed"], 1)
-
     def test_ingest_structured_jsonl_uses_local_backend(self) -> None:
         documents = [
             Document(
@@ -59,7 +34,6 @@ class IngestionEntrypointTests(unittest.TestCase):
 
             summary = ingest_structured_jsonl(
                 input_path=Path("articles.jsonl"),
-                index_backend="local",
                 collection_name="local-collection",
                 force_recreate=True,
                 batch_size=16,
@@ -73,9 +47,10 @@ class IngestionEntrypointTests(unittest.TestCase):
             batch_size=16,
             wait=False,
         )
-        self.assertEqual(summary["index_backend"], "local")
         self.assertEqual(summary["collection_name"], "local-collection")
         self.assertEqual(summary["documents_indexed"], 1)
+        self.assertEqual(summary["articles_indexed"], 1)
+        self.assertTrue(summary["force_recreate"])
 
 
 if __name__ == "__main__":
